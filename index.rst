@@ -20,4 +20,5 @@ documentation for details.
    python_server
    ai_task_summary/build_reStructedText_task
    ai_task_summary/qemu_boot_linux_process
+   opendataloader_pdf_usage
 
