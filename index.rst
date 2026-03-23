@@ -22,4 +22,5 @@ documentation for details.
    ai_task_summary/qemu_boot_linux_process
    opendataloader_pdf_usage
    smmu
+   lpddr5
 
