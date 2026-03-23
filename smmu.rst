@@ -245,3 +245,166 @@ CD (Context Descriptor) — 64 字节
    - 两阶段级联：VA --[Stage 1]--> IPA --[Stage 2]--> PA
 
 参考：IHI0070G Chapter 3 Operation 和 Chapter 5 Data structure formats（5.2 STE 和 5.4 CD）。
+
+SMMU 在虚拟化里的用法
+======================
+
+**问题**：SMMU 在虚拟化里都有哪几种用法？
+
+**解答**：
+
+SMMU 在虚拟化场景中主要有以下几种用法，由 ``STE.Config`` 字段控制：
+
+用法一：Stage 2 Only — 设备直通（Passthrough）
+---------------------------------------------
+
+**配置**：``STE.Config = 0b110``（Stage 2 Translate，Stage 1 Bypass）
+
+设备可以直接分配给 Guest VM 使用，无需 Guest 与 SMMU 交互。
+
+- Hypervisor 为设备配置 STE，设置 Stage 2 翻译表基址和 VMID
+- Stage 1 处于旁路状态，设备发出的地址直接作为 IPA 输入 Stage 2
+- Guest OS 看到的设备就像直接连接在系统总线上，设备可以直接用 IPA（Guest 认为是 PA）做 DMA
+- Guest 不需要知道 SMMU 的存在，也不需要 SMMU 驱动
+
+**适用场景**：
+
+- 简单的设备直通，如将网卡、磁盘控制器直接分配给 VM
+- Guest 期望使用 40 位 DMA 地址（VMSAv8-32 LPAE），Stage 2 旁路 IAS 可以大于 PA，支持此场景
+- 不需要进程级 DMA 隔离的设备
+
+**关键点**：
+
+- 多个设备可以共享同一套 Stage 2 翻译表（属于同一 VM）
+- SubstreamID/PASID 不能使用（Stage 1 旁路时发送 SubstreamID 会导致事务终止）
+- Hypervisor 完全控制 Stream Table 和 Stage 2 翻译表
+
+用法二：Nested（Stage 1 + Stage 2）— Hypervisor 仿真 SMMU
+-----------------------------------------------------------
+
+**配置**：``STE.Config = 0b111``（Stage 1 Translate + Stage 2 Translate）
+
+Guest OS 需要使用 Stage 1 翻译（如进程级 DMA 隔离），但 SMMU 不提供直接供 VM 使用的编程接口。Hypervisor 通过仿真虚拟 SMMU 的方式为 Guest 提供完整的 SMMU 编程体验。
+
+**工作原理**：
+
+- Guest OS 认为自己控制一个真实的 SMMU（Stage 1 Only），拥有自己的 Command Queue、Event Queue 和 PRI Queue
+- 实际上 Hypervisor 充当中间层，将 Guest 的虚拟 SMMU 操作转换为物理 SMMU 操作
+- Hypervisor 维护物理 Stream Table 和 Stage 2 翻译表
+- Guest 管理的 CD 和 Stage 1 翻译表以 IPA 编址，由 Stage 2 翻译到 PA
+
+**Hypervisor 的职责**：
+
+- **STE 转换**：将 Guest 的虚拟 STE 转换为物理 SMMU STE，控制权限和功能
+- **StreamID 映射**：物理 StreamID 可能对 Guest 不可见，Guest 使用虚拟 StreamID，Hypervisor 维护映射关系
+- **命令代理**：读取并解释 Guest Command Queue 中的命令，转换为物理 SMMU 命令或更新内部影子数据结构
+- **事件转发**：从 Host Event Queue 和 PRI Queue 中消费条目，将 Host StreamID 映射为 Guest StreamID，投递到 Guest 的 Event/PRI 队列
+
+**适用场景**：
+
+- 需要进程级 DMA 隔离的设备直通（如 GPU SR-IOV，多个进程共享同一 PCIe Function）
+- 使用 PASID/SubstreamID 区分同一设备的不同 DMA 上下文
+- Guest 需要使用 ATS 和 PRI 进行页式 DMA
+
+**故障处理模型**：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 20 20 20 20
+
+   * - Stage 1
+     - Stage 2
+     - 行为
+     - Guest 视角
+   * - Fault
+     - -
+     - Terminate
+     - 收到 Stage 1 Only 事件
+   * - Fault
+     - -
+     - Stall
+     - 收到 Stage 1 Stall 事件，Guest 需发送 CMD_RESUME
+   * - OK
+     - Fault
+     - Terminate
+     - Hypervisor 可记录 IPA 用于调试，可能作为 Stage 1 外部中止传递给 Guest
+   * - Stall
+     - Fault
+     - Stall (Stage 1)
+     - Guest 收到 Stage 1 Stall 事件
+
+**关键点**：
+
+- ``STE.S1STALLD`` 可以禁止 Guest 使用 Stall 模式，防止 stalled 事务影响其他 VM
+- ``STE.EATS`` 控制 ATS 行为：``0b01``=Full ATS，``0b10``=Split-stage ATS（ATS 返回 IPA，后续 Translated 事务再经 Stage 2 翻译）
+- Split-stage ATS 允许使用 ATS/PRI 的同时保持 Stage 2 隔离
+- ``CD.ASET`` 标记 TLB 条目是否参与广播 TLB 失效，Guest 使用的非共享上下文不应匹配全局翻译
+
+用法三：Stage 1 Only — 裸金属 OS
+-------------------------------
+
+**配置**：``STE.Config = 0b101``（Stage 1 Translate，Stage 2 Bypass）
+
+非虚拟化场景，裸金属 OS 同时管理 Stream Table、CD 和 Stage 1 翻译表。
+
+- S1ContextPtr 和翻译表基址为 PA（不经 Stage 2 翻译）
+- 没有 Hypervisor 参与，OS 直接使用 SMMU
+
+**适用场景**：
+
+- 不使用虚拟化的嵌入式系统
+- OS 直接管理所有设备的 DMA 地址翻译和隔离
+
+用法四：Hypervisor 自用 Stage 1
+-------------------------------
+
+Hypervisor 自身也需要使用设备 DMA，此时 Hypervisor 使用独立的 Stage 1 翻译上下文。
+
+- 通过 ``STE.STRW`` 字段选择 StreamWorld 为 NS-EL2 或 NS-EL2-E2H
+- Hypervisor 有自己的 CD 和 Stage 1 翻译表，与 Guest 隔离
+- 这些 CD 以 PA 编址，不受 Stage 2 控制
+
+**适用场景**：
+
+- Hypervisor 直接使用硬件设备进行 DMA 操作
+- 管理网络、存储等基础设施设备
+
+用法五：Full Bypass — 不翻译
+-----------------------------
+
+**配置**：``STE.Config = 0b100``（Stage 1 Bypass + Stage 2 Bypass）
+
+设备的 DMA 事务直接通过 SMMU，不做任何地址翻译。
+
+- 适用于不需要 DMA 隔离的场景
+- 可以通过 STE 的全局属性字段（如 MTCFG、SHCFG 等）覆盖内存类型和共享性属性
+
+总结
+----
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 15 15 52
+
+   * - 用法
+     - Config
+     - 管理者
+     - 说明
+   * - Full Bypass
+     - ``0b100``
+     - 裸金属 OS
+     - 无翻译，事务直接通过
+   * - Stage 1 Only
+     - ``0b101``
+     - 裸金属 OS
+     - VA -> IPA（实际为 PA），进程级 DMA 隔离
+   * - Stage 2 Only
+     - ``0b110``
+     - Hypervisor
+     - IPA -> PA，设备直通，Guest 无需感知 SMMU
+   * - Nested (1+2)
+     - ``0b111``
+     - Hypervisor + Guest
+     - 完整虚拟化，Guest 使用虚拟 SMMU，Hypervisor 仿真
+
+参考：IHI0070G Chapter 3 Operation（3.6 节、3.8 节、3.9 节）。
