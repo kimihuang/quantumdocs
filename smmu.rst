@@ -614,3 +614,265 @@ ATS 与 TLB 的关系
      - ``SMMU_CR0.VMW == 1`` 时，VMID=0xFFFF 的命令可匹配所有 VMID
 
 参考：IHI0070G Chapter 3 Operation（3.17 节）和 Chapter 4 Commands（4.4 节）。
+
+SMMU 的故障处理和 Event Queue 机制
+====================================
+
+**问题**：解释 SMMU 的故障处理和 Event Queue 机制。
+
+**解答**：
+
+故障模型（Fault Models）
+-------------------------
+
+当 DMA 事务经过 SMMU 时，可能在配置查找或翻译过程中遇到错误。SMMU 提供两种故障处理模型，按翻译阶段独立配置。
+
+### Terminate 模型
+
+事务遇到故障后立即终止，向设备返回 abort 响应。如果配置了记录标志（``CD.R`` / ``STE.S2R``），则向 Event Queue 写入一条事件记录。
+
+- **Stage 1 终止**：由 ``CD.A`` 和 ``CD.S`` 控制
+  - ``CD.S == 0, CD.A == 1``：返回 abort
+  - ``CD.S == 0, CD.A == 0``：RAZ/WI 行为（读返回 0，写被忽略）
+- **Stage 2 终止**：由 ``STE.S2S == 0`` 控制，始终返回 abort
+- **Event Queue 满时**：事件记录丢失（不保证投递）
+- PCIe 流必须使用 Terminate 模型（不能 stall），通过 ``STE.S1STALLD == 1`` 强制
+
+### Stall 模型
+
+事务遇到故障后被缓冲（stall），不向设备返回任何响应。SMMU **始终**向 Event Queue 写入事件记录，软件处理后通过 ``CMD_RESUME`` 重试或终止。
+
+- **Stage 1 Stall**：``CD.S == 1`` 且 ``STE.S1STALLD == 0``
+- **Stage 2 Stall**：``STE.S2S == 1``
+- **Stall Tag (STAG)**：SMMU 为每个 stalled 事务分配唯一 STAG，软件通过 ``CMD_RESUME(StreamID, STAG)`` 定位事务
+- **Event Queue 满时**：stall 事件**不丢弃**，队列可写后自动重试并生成新事件
+- **重复抑制**：同一 stream 的相同页面、相同类型的后续 stall 事务可能被抑制（不生成新事件）
+- **早期重试**：SMMU 可以在收到 ``CMD_RESUME`` 之前投机性重试 stalled 事务
+- ``STE.S1STALLD == 1`` 可禁止 Guest VM 使用 Stall 模型，防止 stalled 事务影响其他 VM
+
+### 两阶段组合的故障行为
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 18 15 15 34
+
+   * - Stage 1 配置
+     - Stage 2 配置
+     - 故障阶段
+     - 事务结果
+     - Hypervisor 处理
+   * - Terminate
+     - Terminate
+     - Stage 1
+     - 终止（VA）
+     - 作为 S1 事件传递给 Guest
+   * - Terminate
+     - Terminate
+     - Stage 2
+     - 终止（VA, IPA）
+     - 可能记录 IPA 用于调试
+   * - Terminate
+     - Stall
+     - Stage 1
+     - 终止（VA）
+     - 作为 S1 事件传递给 Guest
+   * - Terminate
+     - Stall
+     - Stage 2
+     - Stall（VA, IPA）
+     - CMD_RESUME(Terminate) 或修复翻译后 CMD_RESUME(Retry)
+   * - Stall
+     - Terminate
+     - Stage 1
+     - Stall（VA）
+     - Guest 发送 CMD_RESUME(Retry/Terminate)
+   * - Stall
+     - Terminate
+     - Stage 2
+     - 终止（VA, IPA）
+     - 可能记录 IPA 用于调试
+   * - Stall
+     - Stall
+     - Stage 1
+     - Stall（VA）
+     - Guest 发送 CMD_RESUME(Retry/Terminate)
+   * - Stall
+     - Stall
+     - Stage 2
+     - Stall（VA, IPA）
+     - Hypervisor 修复 S2 翻译后 CMD_RESUME(Retry)
+
+**注意**：CD/STE 获取失败（``C_BAD_STE``、``C_BAD_CD``）和翻译表遍历外部中止（``F_WALK_EABT``）始终终止事务，不受 Stall 模型控制。
+
+### STALL_MODEL 支持
+
+由 ``SMMU_IDR0.STALL_MODEL`` 指示：
+
+- ``0b00``：同时支持 Stall 和 Terminate（推荐）
+- ``0b01``：仅支持 Terminate
+- ``0b10``：仅支持 Stall
+- ``SMMU_S_CR0.NSSTALLD`` 可以禁止 Non-secure 使用 Stall
+
+Event Queue 机制
+----------------
+
+### 概述
+
+Event Queue 是一个内存中的环形缓冲区，SMMU 作为生产者写入事件记录，软件作为消费者读取。每个 Security State 有独立的 Event Queue。
+
+- 每条事件记录 **32 字节**，小端字节序
+- 通过 ``SMMU_(*_)CR0.EVENTQEN`` 启用
+- ``SMMU_EVENTQ_PROD`` / ``SMMU_EVENTQ_CONS`` 寄存器维护生产/消费指针
+- 软件通过轮询 CONS/PROD 或 MSI 中断感知新事件
+
+### 可写条件
+
+Event Queue 必须同时满足以下条件才可写入：
+
+- 队列已启用（``EVENTQEN == 1``）
+- 队列未满
+- 无未确认的 ``GERROR.EVENTQ_ABT_ERR``
+
+### 三类事件
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - 类别
+     - 说明
+   * - 配置错误（C_*）
+     - 寄存器、STE 或 CD 内容不正确。配置存储在内存中，只有在事务触发使用时才报告错误
+   * - 翻译故障（F_*）
+     - 翻译过程中产生的故障。每笔事务最多产生一个翻译故障事件
+   * - 其他（E_*）
+     - 异步事件，如 ``E_PAGE_REQUEST`` 页面请求提示
+
+### 事件记录格式（公共字段）
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - 字段
+     - 说明
+   * - StreamID
+     - 发起事务的设备 StreamID
+   * - SubstreamID + SSV
+     - SubstreamID 有效标志及值（仅 SSV==1 时有效）
+   * - RnW
+     - 0=写，1=读
+   * - PnU
+     - 特权/非特权（经过 STE 覆盖后的值）
+   * - InD
+     - 指令/数据（经过 STE 覆盖后的值）
+   * - InputAddr[63:0]
+     - 输入地址（VA/IPA，取决于事件类型）
+   * - S2
+     - 故障阶段：0=Stage 1，1=Stage 2
+   * - CLASS
+     - 操作类别：0b00=CD 获取，0b01=翻译表获取，0b10=输入地址
+   * - Stall
+     - 是否为 stalled 事务（Stall==1 的事件永不合并）
+   * - STAG
+     - Stall Tag，用于 CMD_RESUME 定位 stalled 事务
+
+### 完整事件类型列表
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 25 65
+
+   * - 编号
+     - 名称
+     - 说明
+   * - 0x01
+     - F_UUT
+     - 不支持的上游事务（IMPLEMENTATION DEFINED）
+   * - 0x02
+     - C_BAD_STREAMID
+     - StreamID 超出 Stream Table 范围
+   * - 0x03
+     - F_STE_FETCH
+     - STE 获取外部中止
+   * - 0x04
+     - C_BAD_STE
+     - STE 无效（V==0 或配置非法）
+   * - 0x05
+     - F_BAD_ATS_TREQ
+     - ATS Translation Request 失败
+   * - 0x06
+     - F_STREAM_DISABLED
+     - 流被禁用（如 SubstreamID 缺失时 S1DSS==0b00）
+   * - 0x07
+     - F_TRANSL_FORBIDDEN
+     - Translated 流被禁止（ATSCHK 但 EATS 未使能）
+   * - 0x08
+     - C_BAD_SUBSTREAMID
+     - SubstreamID 无效（超出 S1CDMax 范围或 SSV=1 但 S1CDMax=0）
+   * - 0x09
+     - F_CD_FETCH
+     - CD 获取外部中止
+   * - 0x0A
+     - C_BAD_CD
+     - CD 无效（V==0 或配置非法）
+   * - 0x0B
+     - F_WALK_EABT
+     - 翻译表遍历外部中止
+   * - 0x0C
+     - F_TRANSLATION
+     - 翻译故障（页表项无效）
+   * - 0x0D
+     - F_ADDR_SIZE
+     - 地址大小故障（地址超出 VA/IPA 范围）
+   * - 0x0E
+     - F_ACCESS
+     - 访问标志故障（AF==0）
+   * - 0x0F
+     - F_PERMISSION
+     - 权限故障（读写/执行权限不足）
+   * - 0x10
+     - F_TLB_CONFLICT
+     - TLB 冲突
+   * - 0x11
+     - F_CFG_CONFLICT
+     - 配置缓存冲突
+   * - 0x12
+     - E_PAGE_REQUEST
+     - 页面请求提示（可选，仅用于提前通知）
+   * - 0x13
+     - F_VMS_FETCH
+     - VMS 获取外部中止
+   * - 0x14-0x1F
+     - IMPDEF_EVENTn
+     - IMPLEMENTATION DEFINED 事件
+
+### 事件合并（Event Record Merging）
+
+多个相同类型的事件可以合并为一条记录写入 Event Queue，减少队列压力。
+
+- 由 ``STE.MEV`` 控制：``MEV == 0`` 禁止合并（保证一对一映射），``MEV == 1`` 允许合并
+- **Stall == 1 的事件永不合并**
+- ``F_UUT`` 和 ``C_BAD_STE`` 始终可以被合并（在 STE 定位之前）
+- 合并条件：所有已定义字段相同、Stall==0、短时间内连续发生
+
+### Event Queue 溢出处理
+
+- **非 Stall 事件**：队列满时**静默丢弃**，同时触发溢出条件
+- **Stall 事件**：队列满时**不丢弃**，队列可写后自动重试事务并写入新事件
+- Arm 建议软件及时消费 Event Queue 以避免溢出
+
+### Event Queue 外部中止
+
+写入 Event Queue 时发生外部中止会触发 ``GERROR.EVENTQ_ABT_ERR``，可能导致事件丢失（包括 Stall 事件）。
+
+- **同步中止**：PROD 指针不递增，已写入的条目有效
+- **异步中止**：PROD 指针可能递增，所有条目视为无效，软件应清空队列
+
+### 虚拟化中的 Event Queue
+
+- Hypervisor 管理 Host Event Queue，消费条目后将 Host StreamID 映射为 Guest StreamID，投递到 Guest 的虚拟 Event Queue
+- Hypervisor 可能将 Stage 2 故障转换为 Stage 1 外部中止传递给 Guest（如 CD 获取阶段的 Stage 2 故障报告为 ``F_WALK_EABT``）
+- ``STE.MEV == 0`` 的效果在虚拟化中可能被 Hypervisor 覆盖
+
+参考：IHI0070G Chapter 3 Operation（3.12 节）和 Chapter 7 Faults, errors and Event queue（7.2、7.3 节）。
