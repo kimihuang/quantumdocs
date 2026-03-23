@@ -23,4 +23,5 @@ documentation for details.
    opendataloader_pdf_usage
    smmu
    lpddr5
+   lpddr5_dvfs
 
