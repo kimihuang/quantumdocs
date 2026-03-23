@@ -876,3 +876,245 @@ Event Queue 必须同时满足以下条件才可写入：
 - ``STE.MEV == 0`` 的效果在虚拟化中可能被 Hypervisor 覆盖
 
 参考：IHI0070G Chapter 3 Operation（3.12 节）和 Chapter 7 Faults, errors and Event queue（7.2、7.3 节）。
+
+SMMU 的 ATS 和 PRI 机制
+==========================
+
+**问题**：解释 SMMU 的 ATS 和 PRI 机制。
+
+**解答**：
+
+ATS（Address Translation Service）和 PRI（Page Request Interface）是 PCIe 协议提供的两个扩展功能，SMMU 实现对这两个接口的支持以提高 DMA 性能并支持动态分页。ATS 依赖 PRI，但 PRI 不依赖 ATS。
+
+ATS（Address Translation Service）
+------------------------------------
+
+### 概述
+
+ATS 允许 PCIe 端点（Endpoint）在发起实际 DMA 事务之前，主动向 SMMU 请求地址翻译，并将翻译结果缓存在端点本地的 ATC（Address Translation Cache，等效于设备侧 TLB）中。后续 DMA 事务可以直接标记为 Translated，携带物理地址，绕过 SMMU 的翻译。
+
+### ATS 工作流程
+
+```
+Endpoint                          SMMU                           Memory
+   |                               |                               |
+   |-- ATS Translation Request --->|                               |
+   |   (VA, R/W权限, PASID)        |                               |
+   |                               |-- TLB 查找 --> miss?          |
+   |                               |-- 翻译表遍历 (TTW) ---------->|
+   |                               |<-- 翻译结果 (PA, 权限) -------|
+   |                               |-- 插入 SMMU TLB              |
+   |<-- ATS Translation Completion-|                               |
+   |   (PA, 实际授予的权限)         |                               |
+   |                               |                               |
+   |-- Translated DMA (PA) --------|------- (ATSCHK=0) ----------->|
+   |   (标记为 Translated,          |                               |
+   |    绕过 SMMU 翻译)             |                               |
+```
+
+### ATS 使能控制
+
+通过 ``STE.EATS[93:92]`` 字段控制：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 85
+
+   * - EATS 值
+     - 行为
+   * - ``0b00``
+     - ATS 禁用。Translation Request 返回 UR，记录 ``F_BAD_ATS_TREQ``。若 ``ATSCHK==1``，Translated 事务也被终止
+   * - ``0b01``
+     - Full ATS。Translation Request 服务所有已启用的翻译阶段，返回 PA。后续 Translated 事务绕过 SMMU
+   * - ``0b10``
+     - Split-stage ATS。Translation Request 仅执行 Stage 1，返回 IPA 给端点。后续 Translated 事务携带 IPA 经过 SMMU 执行 Stage 2 翻译。要求 ``Config==0b111``、``S2S==0``、``NS1ATS==0``、``ATSCHK==1``
+   * - ``0b11``
+     - Full ATS with DPT checks。同 ``0b01`` 但额外启用每粒度 DPT 检查（``SMMU_IDR3.DPT==1``，StreamWorld 非 EL1 时 ILLEGAL）
+
+### ATSCHK 控制
+
+``SMMU_(*_)CR0.ATSCHK`` 控制 SMMU 是否对 Translated 事务进行额外检查：
+
+- ``ATSCHK == 0``：Translated 事务直接绕过 SMMU，不进行任何检查（性能最优，安全性较低）
+- ``ATSCHK == 1``：Translated 事务仍经过 SMMU，根据 ``STE.EATS`` 检查配置，可执行 Split-stage Stage 2 或 DPT 检查
+
+### ATS 权限检查
+
+- Translation Request 携带读/写权限请求，SMMU 检查翻译表中的实际权限
+- 响应可能返回实际授予的权限（可能是请求权限的子集，例如请求读写但只授予读）
+- 仅执行权限（execute-only, 无读无写）在 ATS 中无法表示，通过 ATS 不可访问
+
+### HTTU 与 ATS
+
+- 如果 ATS Translation Request 对应的翻译有效且 HTTU 使能，SMMU **必须**在收到 ATS 请求时就更新翻译表中的 Access Flag 和 Dirty State
+- 由于 Translated 事务绕过 SMMU，ATS 请求是 SMMU 更新标志的唯一机会
+
+### ATC 失效（CMD_ATC_INV）
+
+当翻译配置变更时，必须按以下顺序执行维护操作：
+
+::
+
+    1. 修改翻译表描述符（barrier 使其对 Shareability 域可见）
+    2. CMD_TLBI_*    （SMMU TLB 失效）
+    3. CMD_SYNC      （确保 TLB 失效完成）
+    4. CMD_ATC_INV   （失效端点 ATC）
+    5. CMD_SYNC      （确保 ATC 失效完成）
+
+``CMD_ATC_INV`` 参数：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - 参数
+     - 说明
+   * - StreamID
+     - 目标设备
+   * - SubstreamID + SSV
+     - PASID 及有效标志
+   * - Global (G)
+     - 全局失效标志（仅 SSV==1 时有效）
+   * - Address[63:12]
+     - 失效起始地址
+   * - Size[5:0]
+     - 失效范围：span = 4096 * 2^Size 字节。Size=52 表示全部失效
+
+### Split-stage ATS
+
+Split-stage ATS（``EATS == 0b10``）允许在使用 ATS 和 PRI 的同时保持 Stage 2 隔离：
+
+- ATS Translation Request 仅执行 Stage 1 翻译，返回 **IPA**（而非 PA）
+- 端点缓存 IPA，后续 Translated 事务携带 IPA 到达 SMMU
+- SMMU 对 Translated 事务执行 Stage 2 翻译（IPA -> PA），保持 Hypervisor 的 Stage 2 控制权
+- 端点的 ATC 缓存的是 IPA，因此 ATC 失效仅需在 Stage 1 变更时进行
+
+适用场景：Hypervisor 需要在虚拟化环境中同时使用 ATS/PRI 和 Stage 2 翻译隔离。
+
+### ATS 配置变更安全流程
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - 操作
+     - 步骤
+   * - 启用 ATS
+     - 设置 EATS != 0 -> 失效 STE 缓存 + CMD_SYNC -> 端点启用 ATS
+   * - 禁用 ATS
+     - 端点禁用 ATS + 失效 ATC + CMD_SYNC -> 设置 EATS == 0 -> 失效 STE 缓存
+   * - 切换 EATS 0b01 <-> 0b10
+     - 必须先禁用 ATS（通过 EATS==0b00），再切换到目标值
+
+### ATS 与安全状态
+
+- ATS 和 PRI 不支持 Secure 流（Secure STE 的 EATS 为 RES0）
+- ``CMD_ATC_INV`` 和 ``CMD_PRI_RESP`` 默认不能针对 Secure StreamID
+- Secure Command Queue 上的 ATS/PRI 支持可选（``SMMU_S_IDR3.SAMS``）
+
+PRI（Page Request Interface）
+-----------------------------
+
+### 概述
+
+PRI 允许 PCIe 端点在 ATS Translation Request 发现页面不存在（not-present）时，主动向软件请求将页面调入内存。这使得设备和 OS/Hypervisor 可以使用未固定的、动态分页的内存进行 DMA。
+
+### PRI 工作流程
+
+```
+Endpoint                          SMMU                         Software
+   |                               |                               |
+   |-- ATS Translation Request --->|                               |
+   |                               |-- 翻译结果: not-present ------|
+   |<-- ATS Completion (R=0,W=0)-|                               |
+   |   (无权限, 表示页不存在)      |                               |
+   |                               |                               |
+   |-- PRI Page Request (PPR) ---->|-- 写入 PRI Queue ------------>|
+   |   (请求页面调入)              |                               |
+   |                               |                     软件处理:
+   |                               |                     - 分配物理页
+   |                               |                     - 更新翻译表
+   |                               |                     - CMD_TLBI_*
+   |                               |                     - CMD_ATC_INV
+   |                               |                     - CMD_PRI_RESP(Success)
+   |                               |<-- CMD_PRI_RESP -----------|
+   |<-- PRG Response (Success) ----|                               |
+   |                               |                               |
+   |-- 重试 ATS Translation ------>|                               |
+   |<-- ATS Completion (PA, R/W) --|                               |
+   |                               |                               |
+   |-- Translated DMA (PA) --------|                               |
+```
+
+### PRI Queue
+
+PRI Queue 是内存中的环形缓冲区，接收来自端点的 Page Request：
+
+- 由 ``SMMU_(*_)CR0.PRIQEN`` 启用
+- 大小由 ``SMMU_IDR1.PRIQS`` 指示（每个 SMMU 的最大 PRI Queue 条目数）
+- 端点通过 PCIe 配置空间的 PRI 机制获得 Page Request Credit（信用值），限制未完成请求的数量
+
+### PRI 响应（CMD_PRI_RESP）
+
+软件处理完页面调入后，通过 ``CMD_PRI_RESP`` 命令响应端点：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Resp 值
+     - 含义
+   * - ``0b00`` ResponseFailure
+     - 永久非分页错误（如设备 ATS/PRI 被禁用）
+   * - ``0b01`` InvalidRequest
+     - 请求组中一个或多个页面调入失败
+   * - ``0b10`` Success
+     - 页面请求组成功调入
+
+### PRI 队列溢出处理
+
+当 PRI Queue 满时：
+
+- ``SMMU_PRIQ_PROD.OVFLG`` 标志置位
+- 新的 PRI 消息被丢弃
+- 对具有 ``Last==1`` 的 Page Request 自动生成 PRG Response（Success），使端点可以稍后重试
+- ``Last==0`` 的 PPR 被静默忽略
+- 软件应尽快消费 PRI Queue 并通过 ``SMMU_PRIQ_CONS.OVACKFLG`` 确认溢出
+
+### 虚拟化中的 PRI
+
+- Hypervisor 管理 Host PRI Queue
+- Guest 设置自己的 PRI Queue，Hypervisor 将 Host PRI Queue 中的 PPR 代理转发到 Guest PRI Queue
+- PRI Queue 信用值分配：Host 总共 L 条，为 Guest 分配 N 条（N <= L），Guest 为其设备分配最多 N 条信用
+- ``STE.PPAR`` 控制 PASID 前缀在 PRI 响应中是否保留
+
+ATS + PRI 使用模型总结
+-------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * - 场景
+     - ATS
+     - PRI
+   * - 固定 DMA（无动态分页）
+     - 可选（提升性能）
+     - 不需要
+   * - 动态分页 DMA（非 PCIe）
+     - 不需要
+     - 不需要（使用 Stall 模式代替）
+   * - 动态分页 DMA（PCIe）
+     - 必须
+     - 必须（PCIe 不支持 Stall）
+   * - 虚拟化 + ATS + Stage 2 隔离
+     - Split-stage ATS (``EATS==0b10``)
+     - 必须
+
+**关键约束**：
+
+- PCIe 设备**不能**使用 Stall 模式（事务可能无限挂起），必须使用 ATS + PRI 实现动态分页
+- 非 PCIe 设备可以使用 SMMU 内部 Stall 模式替代 ATS + PRI
+- PRI 要求 HTTU 支持以确保正确性（软件更新的 Access Flag/Dirty State 与硬件更新保持一致）
+
+参考：IHI0070G Chapter 3 Operation（3.9 节）、Chapter 4 Commands（4.5 节）和 Chapter 8 PRI queue（8.1 节）。
