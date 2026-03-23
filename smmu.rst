@@ -408,3 +408,209 @@ Hypervisor 自身也需要使用设备 DMA，此时 Hypervisor 使用独立的 S
      - 完整虚拟化，Guest 使用虚拟 SMMU，Hypervisor 仿真
 
 参考：IHI0070G Chapter 3 Operation（3.6 节、3.8 节、3.9 节）。
+
+SMMU 的 TLB 和 TLB 维护机制
+==============================
+
+**问题**：解释 SMMU 的 TLB 和 TLB 维护机制。
+
+**解答**：
+
+SMMU 使用 TLB（Translation Lookaside Buffer）缓存翻译结果，避免每次 DMA 事务都执行翻译表遍历（TTW）。TLB 条目通过标签（Tag）区分不同的地址空间和翻译体制。
+
+TLB 概述
+--------
+
+SMMU 中的 TLB 概念与 PE（处理器）的 TLB 类似，缓存的翻译条目按 ``StreamWorld / VMID / ASID / 地址`` 索引。
+
+**SMMU 实现中的 TLB 分布**：
+
+- **集中式 TLB**：位于 SMMU 中央翻译表遍历器内部，可能包含 macro-TLB
+- **分布式 TLB**：位于远程设备端口，TLB miss 时向中央单元请求翻译并本地缓存
+- **设备内嵌 TLB**：高性能设备（如 GPU、PCIe RC）内部集成 TLB，通过 SMMU 编程接口获取翻译
+
+``StreamWorld + VMID + ASID + VA  -->  TLB 查找  -->  命中: 直接返回 PA
+                                              未命中: 翻译表遍历 (TTW) --> 填充 TLB
+```
+
+TLB 标签体系
+----------
+
+每个缓存的翻译条目标记有以下标签：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 15 15 55
+
+   * - StreamWorld
+     - ASID
+     - VMID
+     - 说明
+   * - NS-EL1
+     - 是（nG==1）
+     - 是（S2P=1）
+     - Guest OS 的标准翻译体制
+   * - NS-EL2 / S-EL2 / Realm-EL2
+     - 否
+     - 否
+     - Hypervisor 翻译体制，无 ASID
+   * - NS-EL2-E2H / S-EL2-E2H / Realm-EL2-E2H
+     - 是（nG==1）
+     - 否
+     - E2H 模式下支持 ASID
+   * - Secure
+     - 是（nG==1）
+     - 是（SEL2=1）
+     - 安全态 EL1 翻译
+   * - EL3
+     - 否
+     - 否
+     - 安全监控态，无 ASID
+
+**关键规则**：
+
+- 不同 StreamWorld 的 TLB 条目完全隔离，不会互相匹配
+- 同一 VMID 下不同 ASID 的地址空间互相隔离
+- ``CD.ASET`` 标志区分共享（ASET=0）和非共享（ASET=1）地址空间，影响广播 TLB 失效行为
+- Global 翻译（TTD.nG==0）可以匹配任意 ASID，但仍受 StreamWorld 和 ASET 约束
+
+TLB 维护机制
+------------
+
+SMMU 的 TLB 维护通过以下两种方式进行：
+
+### 1. SMMU 命令（CMD_TLBI_*）
+
+通过 Command Queue 发送 TLB 失效命令，仅影响 SMMU 自身的 TLB，不产生广播。在 CMD_TLBI_* 命令序列后必须跟 ``CMD_SYNC`` 确保失效完成。
+
+**Stage 1 TLB 失效命令**：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 30 35
+
+   * - 命令
+     - 参数
+     - 等效 PE 操作
+   * - ``CMD_TLBI_NH_ALL(VMID)``
+     - VMID
+     - VMALLE1IS：失效指定 VMID 下所有 NS-EL1 条目（含 Global）
+   * - ``CMD_TLBI_NH_ASID(VMID, ASID)``
+     - VMID, ASID
+     - ASIDE1IS：失效指定 VMID+ASID 的非 Global 条目
+   * - ``CMD_TLBI_NH_VAA(VMID, Addr, ...)``
+     - VMID, VA, TG, TTL, NUM, SCALE
+     - VAAE1IS：按地址失效，支持范围失效和层级提示
+   * - ``CMD_TLBI_NH_VA(VMID, Addr, ...)``
+     - VMID, VA, TG, TTL, NUM, SCALE
+     - VAE1IS：按地址+ASID 失效
+   * - ``CMD_TLBI_NSNH_ALL``
+     - -
+     - ALLE1IS：失效所有 NS 条目（不区分 VMID）
+   * - ``CMD_TLBI_EL2_ALL``
+     - -
+     - ALLE2IS：失效所有 EL2 条目
+   * - ``CMD_TLBI_EL2_ASID(ASID)``
+     - ASID
+     - E2ALL: 失效指定 ASID 的 EL2 条目
+   * - ``CMD_TLBI_EL2_VA(Addr, ...)``
+     - VA, TG, TTL, NUM, SCALE
+     - E2VA: 按 EL2 地址失效
+   * - ``CMD_TLBI_EL2_VAA(Addr, ...)``
+     - VA, TG, TTL, NUM, SCALE
+     - E2VAA: 按地址失效（忽略 ASID）
+   * - ``CMD_TLBI_EL3_ALL``
+     - -
+     - ALLE3IS：失效所有 EL3 条目
+   * - ``CMD_TLBI_EL3_VA(Addr, ...)``
+     - VA, TG, TTL, NUM, SCALE
+     - VAE3IS：按 EL3 地址失效
+
+**Stage 2 TLB 失效命令**：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 30 35
+
+   * - 命令
+     - 参数
+     - 等效 PE 操作
+   * - ``CMD_TLBI_S2_ALL(VMID)``
+     - VMID
+     - ALLE1IS：失效指定 VMID 下所有 Stage 2 条目
+   * - ``CMD_TLBI_S2_IPA(VMID, Addr, ...)``
+     - VMID, IPA, TG, TTL, NUM, SCALE
+     - IPAS2E1IS：按 IPA 地址失效 Stage 2 条目
+   * - ``CMD_TLBI_S2_IPA_ALL(VMID, Addr, ...)``
+     - VMID, IPA, TG, TTL, NUM, SCALE
+     - RIPAS2E1IS：按 IPA 地址失效（Range + TTL hint）
+   * - ``CMD_TLBI_NSNH_ALL``
+     - -
+     - ALLE1IS：失效所有 NS Stage 1 和 Stage 2 条目
+
+### 2. PE 广播 TLB 失效（Broadcast TLB Invalidation）
+
+当 ``SMMU_IDR0.BTM == 1`` 时，SMMU 可以接收 PE 发出的广播 TLB 失效消息（通过 DVM 协议）。
+
+- PE 执行 ``TLBI`` 指令后，通过互连广播到同一 Inner/Outer Shareable 域内的 SMMU
+- 广播消息包含地址、ASID、VMID 和翻译体制
+- SMMU 根据这些参数匹配并失效对应的 TLB 条目
+- ``SMMU_CR2.PTM == 1`` 可禁用指定 Security State 的广播 TLB 失效
+
+**CD.ASET 对广播失效的影响**：
+
+- ``ASET == 0``：ASID 与 PE 进程共享，TLB 条目**必须**被所有匹配的广播失效操作影响
+- ``ASET == 1``：ASID 非共享（设备专用地址空间），TLB 条目**不要求**被 ``VA{L}ExIS`` 和 ``ASIDExIS`` 失效，但仍被 ``ALLEXIS`` 影响
+
+### 3. 范围失效与层级提示（Range + TTL）
+
+SMMUv3.2+ 强制支持（``SMMU_IDR3.RIL == 1``），SMMUv3.0/3.1 可选。
+
+**范围失效**：一次命令失效连续的地址范围::
+
+    Range = ((NUM + 1) * 2^SCALE) * Translation_Granule_Size
+
+**层级提示（TTL）**：提示 TLB 条目所在的翻译表层级，缩小失效范围，减少不必要的失效::
+
+    TTL == 0b00: 任意层级
+    TTL == 0b01: Level 1 叶条目
+    TTL == 0b10: Level 2 叶条目
+    TTL == 0b11: Level 3 叶条目
+
+**TG（Translation Granule）** 指定失效的粒度大小：
+
+- ``0b00``：任意粒度（无范围失效，无 TTL）
+- ``0b01``：4KB
+- ``0b10``：16KB
+- ``0b11``：64KB
+
+ATS 与 TLB 的关系
+-----------------
+
+当使用 PCIe ATS 时：
+
+- ATS Translation Request 可能直接使用 SMMU TLB 中的条目返回，也可能触发新的翻译表遍历并插入 TLB
+- 翻译配置变更时，必须**先执行 SMMU TLB 失效，再执行 ATC 失效**（CMD_ATC_INV）
+- ``CMD_SYNC`` 确保 SMMU TLB 失效完成后再发起 ATC 失效
+
+总结
+----
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - 维护方式
+     - 说明
+   * - CMD_TLBI_* 命令
+     - 通过 Command Queue 发送，仅影响 SMMU TLB，需 CMD_SYNC 确保完成
+   * - PE 广播失效
+     - PE TLBI 指令通过 DVM 协议广播，SMMU 根据 VMID/ASID/StreamWorld 匹配
+   * - CMD_ATC_INV
+     - 失效端点 ATC（设备侧 TLB），需先完成 SMMU TLB 失效
+   * - CMD_CFGI_*
+     - 失效 STE 和 CD 配置缓存（与 TLB 失效是独立的操作）
+   * - VMID Wildcards
+     - ``SMMU_CR0.VMW == 1`` 时，VMID=0xFFFF 的命令可匹配所有 VMID
+
+参考：IHI0070G Chapter 3 Operation（3.17 节）和 Chapter 4 Commands（4.4 节）。
