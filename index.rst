@@ -16,6 +16,7 @@ documentation for details.
    :caption: Contents:
 
    install_rst
+   labgrid_for_qemu
    tmux_usage
    python_server
    ai_task_summary/build_reStructedText_task
