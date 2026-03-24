@@ -21,7 +21,8 @@ QEMU 启动 Linux 内核过程记录
 
     boot_kernel [monitor] [no-memdisk]
 
-### 启动流程
+启动流程
+^^^^^^^^
 
 1. **检查板卡配置**：确保已选择板卡配置
 2. **解析参数**：处理 `monitor` 和 `no-memdisk` 参数
@@ -45,7 +46,8 @@ QEMU 启动 Linux 内核过程记录
 
     boot_uboot [monitor]
 
-### 启动流程
+启动流程
+^^^^^^^^
 
 1. **检查板卡配置**：确保已选择板卡配置
 2. **解析参数**：处理 `monitor` 参数
