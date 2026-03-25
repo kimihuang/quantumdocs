@@ -25,4 +25,5 @@ documentation for details.
    smmu
    lpddr5
    lpddr5_dvfs
+   ttyd_setup
 
