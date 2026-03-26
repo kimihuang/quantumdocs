@@ -21,6 +21,17 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', 'venv']
 
 language = 'zh_CN'
 
+# -- Options for EPUB output --------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-epub-output
+
+epub_basename = 'quantum'
+epub_author = 'Quantum Team'
+epub_publisher = 'Quantum Team'
+epub_copyright = '2026, Quantum Team'
+epub_identifier = 'https://github.com/quantum/quantumdocs'
+epub_language = 'zh_CN'
+epub_theme = 'epub'
+
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
