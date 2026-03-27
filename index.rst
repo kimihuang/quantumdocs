@@ -25,6 +25,7 @@ documentation for details.
    arm/mmu
    corelink_mmu600ae_trm
    corelink_mmu600ae_coherency
+   corelink_mmu600ae_ras_pmu
    smmu
    lpddr5
    lpddr5_dvfs
