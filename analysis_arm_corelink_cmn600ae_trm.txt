@@ -1,0 +1,4 @@
+  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/arm/corelink_mmu600ae_trm_101412_0100_07_en.md
+    output: docs/quantumdocs/corelink_mmu600ae_trm.rst
+    scope:  TCU,TBU

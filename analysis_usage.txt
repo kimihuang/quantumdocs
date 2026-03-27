@@ -1,0 +1,42 @@
+最简单的方式：一句话
+
+  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/DDR/LPDDR5_Specification.md
+    output: docs/quantumdocs/lpddr5_odt.rst
+    scope:  ODT, NT-ODT, termination
+
+  我会读取 analysis_prompt.txt 中的规则，按照里面定义的格式输出分析文档。
+
+  如果不确定 scope 怎么填
+
+  直接用自然语言描述你的需求：
+
+  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/DDR/LPDDR5_Specification.md
+    output: docs/quantumdocs/lpddr5_refresh.rst
+    scope:  分析 LPDDR5 的刷新机制，包括 tREFI、tRFC、Self Refresh、PASR
+
+  我会根据你的描述自动定位相关章节并分析。
+
+  分步深入的方式
+
+  先给一个宽泛的 scope，看完输出后再追问：
+
+  # 第一步：概览
+  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/DDR/LPDDR5_Specification.md
+    output: docs/quantumdocs/lpddr5_power.rst
+    scope:  电源管理和低功耗模式
+
+  # 看完输出后，第二步：针对某个点深入
+  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/DDR/LPDDR5_Specification.md
+    output: docs/quantumdocs/lpddr5_dvfs.rst
+    scope:  DVFSQ 的完整转换流程，包括 VDDQ 切换和 ZQ 校准的影响
+
+  总结
+
+  - txt 文件不用改，它是固定的规则模板
+  - input/output/scope 每次对话中指定即可
+  - scope 可以用预定义关键词（architecture、timing 等），也可以用自然语言描述
+  - 不确定怎么分时，先用宽泛的 scope 让我生成概览，再逐步聚焦

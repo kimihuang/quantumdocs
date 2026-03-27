@@ -23,6 +23,7 @@ documentation for details.
    ai_task_summary/qemu_boot_linux_process
    opendataloader_pdf_usage
    arm/mmu
+   corelink_mmu600ae_trm
    smmu
    lpddr5
    lpddr5_dvfs
