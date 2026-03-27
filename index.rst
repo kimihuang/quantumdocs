@@ -24,6 +24,7 @@ documentation for details.
    opendataloader_pdf_usage
    arm/mmu
    corelink_mmu600ae_trm
+   corelink_mmu600ae_coherency
    smmu
    lpddr5
    lpddr5_dvfs
