@@ -19,6 +19,7 @@ documentation for details.
    labgrid_for_qemu
    tmux_usage
    python_server
+   macos_remotedesktop_to_ubuntu
    ai_task_summary/build_reStructedText_task
    ai_task_summary/qemu_boot_linux_process
    opendataloader_pdf_usage
