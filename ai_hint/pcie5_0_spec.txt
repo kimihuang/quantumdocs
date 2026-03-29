@@ -1,0 +1,15 @@
+请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
+    input:  docs/pdf/PCIE/PCI_Express_Base_5.0r1.0.md
+    output: docs/quantumdocs/pcie/PCI_Express_Base_5_0.rst
+    scope:  全篇通读，梳理文档结构,对于知识点需要解释，不能只列出知识点
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题, 所有内容均需来自文档，需标识引用原文章节，不能杜撰
+
+请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
+    input:  docs/pdf/PCIE/PCI_Express_Base_5.0r1.0.md
+    output: docs/quantumdocs/pcie/PCI_Express_Base_5_0_ATS.rst
+    scope:  重点分析PCIE 与SMMU,CMN，ATS,PRI，MSI，详细梳理模块框图，关键链路
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题, 所有内容均需来自文档，需标识引用原文章节，不能杜撰
+
+请按照 docs/quantumdocs/ai_hint/translate_prompt.txt 执行
+    input:  docs/pdf/PCIE/PCI_Express_Base_5.0r1.0.md
+    output: docs/quantumdocs/pcie/PCI_Express_Base_5.0r1.0.md

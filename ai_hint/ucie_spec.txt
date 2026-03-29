@@ -1,0 +1,5 @@
+请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
+    input:  docs/pdf/ucie/UCIE_SPECIFICATION_2.0.md
+    output: docs/quantumdocs/ucie/UCIE_SPECIFICATION.rst 
+    scope:  全篇通读，梳理文档结构
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题

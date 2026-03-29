@@ -1,4 +1,5 @@
-  请按照 docs/quantumdocs/analysis_prompt.txt 执行
+  请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
     input:  docs/pdf/arm/corelink_mmu600ae_trm_101412_0100_07_en.md
     output: docs/quantumdocs/corelink_mmu600ae_trm.rst
     scope:  TCU,TBU
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题
