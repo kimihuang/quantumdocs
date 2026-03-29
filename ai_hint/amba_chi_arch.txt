@@ -1,0 +1,9 @@
+请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/arm/IHI0050G_amba_chi_architecture_spec.md
+    output: docs/quantumdocs/arm/amba_chi_architecture_spec.rst
+    scope:  全篇通读，梳理文档结构
+
+请按照 docs/quantumdocs/analysis_prompt.txt 执行
+    input:  docs/pdf/arm/IHI0050G_amba_chi_architecture_spec.md
+    output: docs/quantumdocs/arm/amba_chi_architecture_coherency.rst 输出为中文
+    scope:  详细分析一致性协议，从整体到局部，深入分析，详尽解释,

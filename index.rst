@@ -14,21 +14,26 @@ documentation for details.
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
+   :numbered:
 
-   install_rst
-   labgrid_for_qemu
-   tmux_usage
-   python_server
-   macos_remotedesktop_to_ubuntu
-   ai_task_summary/build_reStructedText_task
-   ai_task_summary/qemu_boot_linux_process
-   opendataloader_pdf_usage
-   arm/mmu
-   corelink_mmu600ae_trm
-   corelink_mmu600ae_coherency
-   corelink_mmu600ae_ras_pmu
-   smmu
+   rst_format
+   arm/mmu_arch
+   arm/chi/amba_chi_architecture_spec
+   arm/chi/amba_chi_architecture_coherency
+   arm/chi/amba_chi_architecture_coherency_codebuddy
+   arm/smmu_arch
+   arm/mmu600ae/corelink_mmu600ae_trm
+   arm/mmu600ae/corelink_mmu600ae_coherency
+   arm/mmu600ae/corelink_mmu600ae_ras_pmu
    lpddr5
    lpddr5_dvfs
+   install_rst
+   tmux_usage
+   python_server
+   labgrid_for_qemu
    ttyd_setup
+   macos_remotedesktop_to_ubuntu
+   opendataloader_pdf_usage
+   ai_task_summary/build_reStructedText_task
+   ai_task_summary/qemu_boot_linux_process
 

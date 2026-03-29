@@ -22,10 +22,8 @@
 
 ### output（必填）
 
-输出的 rst 文件路径。建议按主题分文件命名，例如：
-- `smmu.rst`
-- `lpddr5.rst`
-- `lpddr5_dvfs.rst`
+输出的 rst 文件路径。注意目录分级，建议按主题分文件命名，例如：
+- `arm/mmu.rst`
 
 ### scope（推荐填写）
 

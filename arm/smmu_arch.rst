@@ -1,3 +1,4 @@
+==============
 SMMU 学习笔记
 ==============
 
@@ -7,7 +8,7 @@ SMMU 学习笔记
 .. contents::
 
 SMMU Stage 1 和 Stage 2 转换有什么区别
-========================================
+----------------------------------------
 
 **问题**：SMMU stage 1 和 stage 2 转换有什么区别？
 
@@ -16,7 +17,7 @@ SMMU Stage 1 和 Stage 2 转换有什么区别
 Stage 1 和 Stage 2 是 SMMU 的两阶段地址转换，类似于 ARMv8-A 虚拟化扩展中 PE 的两阶段转换。每个阶段可以独立启用。
 
 Stage 1: VA -> IPA
-------------------
+~~~~~~~~~~~~~~~~~~
 
 **用途**：由软件实体（如 Guest OS）使用，为设备 DMA 提供隔离或地址翻译。
 
@@ -27,7 +28,7 @@ Stage 1: VA -> IPA
 - **管理者**：由 **Guest OS** 管理 CD 和 stage 1 翻译表
 
 Stage 2: IPA -> PA
-------------------
+~~~~~~~~~~~~~~~~~~
 
 **用途**：在支持虚拟化扩展的系统中，将设备 DMA 虚拟化到 Guest VM 的地址空间。
 
@@ -38,7 +39,7 @@ Stage 2: IPA -> PA
 - **管理者**：由 **Hypervisor** 管理 STE 和 stage 2 翻译表
 
 嵌套模式（Nested）
-------------------
+~~~~~~~~~~~~~~~~~~
 
 当两个阶段都启用时，地址转换流程为::
 
@@ -49,7 +50,7 @@ Stage 2: IPA -> PA
 - 每个 StreamID 只能对应一个 stage 2 上下文，但可以对应多个 stage 1 上下文（通过 SubstreamID）
 
 对比总结
---------
+~~~~~~~~
 
 .. list-table::
    :header-rows: 1
@@ -80,7 +81,7 @@ Stage 2: IPA -> PA
 参考：IHI0070G Chapter 2 Introduction 和 Chapter 3 Operation。
 
 SMMU STE 和 CD 的数据结构是怎样的
-====================================
+------------------------------------
 
 **问题**：SMMU STE (Stream Table Entry) 和 CD (Context Descriptor) 的数据结构是怎样的？
 
@@ -247,7 +248,7 @@ CD (Context Descriptor) — 64 字节
 参考：IHI0070G Chapter 3 Operation 和 Chapter 5 Data structure formats（5.2 STE 和 5.4 CD）。
 
 SMMU 在虚拟化里的用法
-======================
+----------------------
 
 **问题**：SMMU 在虚拟化里都有哪几种用法？
 
@@ -410,7 +411,7 @@ Hypervisor 自身也需要使用设备 DMA，此时 Hypervisor 使用独立的 S
 参考：IHI0070G Chapter 3 Operation（3.6 节、3.8 节、3.9 节）。
 
 SMMU 的 TLB 和 TLB 维护机制
-==============================
+------------------------------
 
 **问题**：解释 SMMU 的 TLB 和 TLB 维护机制。
 
@@ -618,7 +619,7 @@ ATS 与 TLB 的关系
 参考：IHI0070G Chapter 3 Operation（3.17 节）和 Chapter 4 Commands（4.4 节）。
 
 SMMU 的故障处理和 Event Queue 机制
-====================================
+------------------------------------
 
 **问题**：解释 SMMU 的故障处理和 Event Queue 机制。
 
@@ -893,7 +894,7 @@ Event Queue 外部中止
 参考：IHI0070G Chapter 3 Operation（3.12 节）和 Chapter 7 Faults, errors and Event queue（7.2、7.3 节）。
 
 SMMU 的 ATS 和 PRI 机制
-==========================
+--------------------------
 
 **问题**：解释 SMMU 的 ATS 和 PRI 机制。
 
