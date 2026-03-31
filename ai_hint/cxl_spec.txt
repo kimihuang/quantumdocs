@@ -1,0 +1,15 @@
+请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
+    input:  docs/pdf/CXL/CXL_Spec_3.0_v0.7.pdf.md
+	output: docs/quantumdocs/cxl/CXL_Spec.rst
+    scope:  全篇通读，梳理文档结构,对于知识点需要解释，不能只列出知识点
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题, 所有内容均需来自文档，需标识引用原文章节，不能杜撰
+
+请按照 docs/quantumdocs/ai_hint/analysis_prompt.txt 执行
+    input:  docs/pdf/CXL/CXL_Spec_3.0_v0.7.pdf.md
+	output: docs/quantumdocs/cxl/CXL_Spec_io_cache_mem.rst
+    scope: 精读并深入分析CXL.io、CXL.cache 和 CXL.mem,需要输出框图及关键链路 
+    requirement: 输出为中文,标题不标记序号, 只有一个一级标题, 所有内容均需来自文档，需标识引用原文章节，不能杜撰
+
+请按照 docs/quantumdocs/ai_hint/translate_prompt.txt 执行
+    input:  docs/pdf/PCIE/PCI_Express_Base_5.0r1.0.md
+    output: docs/quantumdocs/pcie/PCI_Express_Base_5.0r1.0.md

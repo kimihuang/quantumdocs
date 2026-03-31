@@ -28,6 +28,8 @@ documentation for details.
    ucie/UCIE_SPECIFICATION
    pcie/PCI_Express_Base_5_0
    pcie/PCI_Express_Base_5_0_ATS
+   cxl/CXL_Spec.rst
+   cxl/CXL_Spec_io_cache_mem
    lpddr5
    lpddr5_dvfs
    install_rst
@@ -39,4 +41,5 @@ documentation for details.
    opendataloader_pdf_usage
    ai_task_summary/build_reStructedText_task
    ai_task_summary/qemu_boot_linux_process
+   buildroot_autologin_troubleshooting
 
