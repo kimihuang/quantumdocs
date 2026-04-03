@@ -42,4 +42,7 @@ documentation for details.
    ai_task_summary/qemu_boot_linux_process
    buildroot_autologin_troubleshooting
    systemd_enable
+   prompt_guide_kernel_source_analysis
+   driver_analysis_arm_pmu
+   codebuddy_cli_usage_guide
 
