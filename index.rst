@@ -46,4 +46,4 @@ documentation for details.
    prompt_guide_kernel_source_analysis
    driver_analysis_arm_pmu
    codebuddy_cli_usage_guide
-
+   systemd/systemd_log_annotated
