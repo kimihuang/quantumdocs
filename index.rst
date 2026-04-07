@@ -26,6 +26,7 @@ documentation for details.
    arm/mmu600ae/corelink_mmu600ae_coherency
    arm/mmu600ae/corelink_mmu600ae_ras_pmu
    smmu_code_analysis
+   dma_alloc_coherent_analysis
    ucie/UCIE_SPECIFICATION
    pcie/PCI_Express_Base_5_0
    pcie/PCI_Express_Base_5_0_ATS
