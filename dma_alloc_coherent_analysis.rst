@@ -129,8 +129,8 @@ CPU 和设备均可访问的一致性 DMA 内存缓冲区。该函数返回 CPU 
    │
    └── *dma_handle = phys_to_dma_direct()      [物理→总线地址转换]
 
-2.4 IOMMU 路径调用链
-~~~~~~~~~~~~~~~~~~~~~
+2.4 IOMMU 路径完整调用链 (含 ARM SMMU)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 **iommu_dma_alloc** — ``drivers/iommu/dma-iommu.c:1442``
 
@@ -138,26 +138,136 @@ CPU 和设备均可访问的一致性 DMA 内存缓冲区。该函数返回 CPU 
 
    iommu_dma_alloc()  [drivers/iommu/dma-iommu.c:1442]
    │
-   ├── [阻塞 + !FORCE_CONTIGUOUS]
-   │   └── iommu_dma_alloc_remap()             [dma-iommu.c:1351]
-   │       ├── alloc_pages()                   [分配页面]
-   │       ├── dma_common_pages_remap()        [remap.c:22]
-   │       │   └── vmap() → VM_DMA_COHERENT
-   │       └── __iommu_dma_map()               [IOVA 映射]
-   │           └── iommu_map()                 [IOMMU 驱动]
+   ├── dma_info_to_prot(DMA_BIDIRECTIONAL, coherent, attrs)  [dma-iommu.c:605]
+   │   └── 转换 DMA 方向 → IOMMU 保护标志 (IOMMU_READ|IOMMU_WRITE|IOMMU_CACHE)
    │
-   ├── [非阻塞 + 非一致 + DMA_DIRECT_REMAP]
+   ├── [路径 A: 阻塞 + !FORCE_CONTIGUOUS] → 最常用路径
+   │   └── iommu_dma_alloc_remap()             [dma-iommu.c:856]
+   │       │
+   │       ├── __iommu_dma_alloc_noncontiguous()  [dma-iommu.c:789]
+   │       │   │
+   │       │   ├── iommu_get_dma_domain(dev)        [获取 IOMMU domain]
+   │       │   ├── iommu_dma_cookie / iova_domain   [IOVA 管理器]
+   │       │   │
+   │       │   ├── __iommu_dma_alloc_pages()      [dma-iommu.c:730]
+   │       │   │   ├── kvcalloc(count, sizeof(*pages))  [页面指针数组]
+   │       │   │   ├── gfp |= __GFP_HIGHMEM  [IOMMU 允许 HighMem]
+   │       │   │   └── alloc_pages_node(nid, alloc_flags, order)
+   │       │   │       └── Buddy System 分配 (非连续 OK)
+   │       │   │
+   │       │   ├── iommu_dma_alloc_iova()       [dma-iommu.c:625]
+   │       │   │   ├── alloc_iova_fast(iovad, iova_len, dma_limit>>shift)
+   │       │   │   │   └── iova_rcache_get() / alloc_iova()  [iova.c:439]
+   │       │   │   └── PCI 设备优先分配 SAC (< 4GB) IOVA
+   │       │   │
+   │       │   ├── sg_alloc_table_from_pages()  [构建 sg_table]
+   │       │   │
+   │       │   ├── [非一致] arch_dma_prep_coherent()  [清理 cache]
+   │       │   │
+   │       │   └── iommu_map_sg_atomic()       [IOVA → 物理地址映射]
+   │       │       └── ───→ 见下方 2.4.1 IOMMU Core 映射链 ───→
+   │       │
+   │       ├── *dma_handle = sgt.sgl->dma_address  [返回 IOVA]
+   │       │
+   │       └── dma_common_pages_remap()         [remap.c:22]
+   │           └── vmap(pages, count, VM_DMA_COHERENT, prot)  [建立内核映射]
+   │
+   ├── [路径 B: 非阻塞 + 非一致 + DMA_DIRECT_REMAP]
    │   └── dma_alloc_from_pool()               [pool.c:265]
-   │       └── gen_pool_alloc()                [原子池]
+   │       └── gen_pool_alloc()                [原子池, 无 IOMMU 映射]
    │
-   └── [默认路径]
-       ├── iommu_dma_alloc_pages()             [dma-iommu.c:1405]
-       │   ├── dma_alloc_contiguous()          [CMA]
-       │   └── alloc_pages_node()              [Buddy]
+   └── [路径 C: FORCE_CONTIGUOUS 或 回退]
        │
-       ├── dma_common_contiguous_remap()       [如需要]
-       └── __iommu_dma_map()                   [IOVA 映射]
-           └── iommu_map()                     [IOMMU 页表映射]
+       ├── iommu_dma_alloc_pages()             [dma-iommu.c:1405]
+       │   ├── dma_alloc_contiguous(dev, size, gfp)    [CMA 优先]
+       │   ├── alloc_pages_node(node, gfp, order)      [Buddy 回退]
+       │   ├── [非一致|HighMem] dma_common_contiguous_remap()
+       │   └── [一致|LowMem] page_address(page)
+       │
+       └── __iommu_dma_map(dev, phys, size, prot, mask)  [dma-iommu.c:697]
+           └── ───→ 见下方 2.4.1 IOMMU Core 映射链 ───→
+
+2.4.1 IOMMU Core 映射链 (__iommu_dma_map → ARM SMMU)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   __iommu_dma_map(dev, phys, size, prot, dma_mask)  [dma-iommu.c:697]
+   │
+   ├── [延迟绑定检查]
+   │   └── iommu_deferred_attach(dev, domain)     [iommu.c:1980]
+   │       └── __iommu_attach_device(domain, dev) [首次使用时绑定]
+   │
+   ├── iommu_dma_alloc_iova(domain, size, dma_mask, dev)  [dma-iommu.c:625]
+   │   ├── alloc_iova_fast(iovad, iova_len, dma_limit >> shift, true)
+   │   │   └── iova_rcache_get() → alloc_iova()  [IOVA 空间分配]
+   │   └── return (dma_addr_t)iova << shift      [IOVA 地址]
+   │
+   └── iommu_map_atomic(domain, iova, phys, size, prot)  [iommu.c:2317]
+       └── _iommu_map(domain, iova, paddr, size, prot, GFP_ATOMIC)  [iommu.c:2296]
+           │
+           ├── __iommu_map()                     [iommu.c:2236]
+           │   └── 循环: __iommu_map_pages()     [iommu.c:2212]
+           │       ├── iommu_pgsize(domain, ...)  [确定页大小和数量]
+           │       │
+           │       ├── [优先] ops->map_pages()    [iommu_domain_ops:287]
+           │       │   │
+           │       │   ▼▼▼ ARM SMMUv3 路径 ▼▼▼
+           │       │   │
+           │       │   arm_smmu_map_pages()      [arm-smmu-v3.c:2472]
+           │       │   └── pgtbl_ops->map_pages()
+           │       │       │
+           │       │       ▼▼▼ ARM LPAE 页表 ▼▼▼
+           │       │       │
+           │       │       arm_lpae_map_pages()  [io-pgtable-arm.c:464]
+           │       │       ├── arm_lpae_prot_to_pte(data, iommu_prot)
+           │       │       │   └── 将 IOMMU_READ|WRITE|CACHE 转为 PTE 位
+           │       │       └── __arm_lpae_map(data, iova, paddr, ...)
+           │       │           ├── 遍历页表层级 (PGD→PUD→PMD→PTE)
+           │       │           ├── 自底向上分配页表页 (alloc_pages)
+           │       │           ├── arm_lpae_install_table() [安装新页表]
+           │       │           └── 写入 PTE: phys_addr | prot | valid
+           │       │       └── wmb()  [写屏障, 确保页表可见后再继续]
+           │       │
+           │       └── [备选] ops->map()         [旧式单页映射]
+           │
+           └── [如定义] ops->iotlb_sync_map()    [SMMUv3 未定义此回调]
+
+2.4.2 IOMMU 释放链 (iommu_dma_free)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   iommu_dma_free(dev, size, cpu_addr, handle, attrs)  [dma-iommu.c:1398]
+   │
+   ├── __iommu_dma_unmap(dev, handle, size)     [dma-iommu.c:674]
+   │   ├── iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather)  [iommu.c:2405]
+   │   │   └── __iommu_unmap()                  [iommu.c:2337]
+   │   │       └── 循环: __iommu_unmap_pages()
+   │   │           └── ops->unmap_pages()       [iommu_domain_ops]
+   │   │               │
+   │   │               ▼▼▼ ARM SMMUv3 路径 ▼▼▼
+   │   │               arm_smmu_unmap_pages()   [arm-smmu-v3.c:2484]
+   │   │               └── pgtbl_ops->unmap_pages()
+   │   │                   └── arm_lpae_unmap_pages()  [io-pgtable-arm.c:664]
+   │   │                       ├── 遍历页表, 清除 PTE valid 位
+   │   │                       └── 收集无效化范围到 iotlb_gather
+   │   │
+   │   ├── [如非 queued] iommu_iotlb_sync()     [TLB 同步]
+   │   │   └── ops->iotlb_sync()
+   │   │       └── arm_smmu_iotlb_sync()        [arm-smmu-v3.c:2505]
+   │   │           └── arm_smmu_tlb_inv_range_domain()
+   │   │               └── 发送 CMDQ_INV_TLB 超过队列到 SMMU 硬件
+   │   │
+   │   └── iommu_dma_free_iova()                [dma-iommu.c:657]
+   │       └── free_iova_fast()                 [iova.c:487]
+   │           └── iova_rcache_insert()          [IOVA 回收]
+   │
+   └── __iommu_dma_free(dev, size, cpu_addr)    [dma-iommu.c:1367]
+       ├── [原子池] dma_free_from_pool()
+       ├── [vmalloc] dma_common_free_remap() → vunmap()
+       │   或 dma_common_find_pages() → __iommu_dma_free_pages()
+       └── [低内存] dma_free_contiguous() → cma_release() / __free_pages()
 
 3. 数据结构
 ------------
@@ -189,156 +299,320 @@ DMA 操作的虚函数表，定义了 DMA 映射的全部操作接口:
        struct sg_table *(*alloc_noncontiguous)(...);
        void (*free_noncontiguous)(...);
 
-       /* 用户空间映射 */
-       int (*mmap)(struct device *, struct vm_area_struct *,
-                   void *, dma_addr_t, size_t, unsigned long attrs);
-
-       /* Scatter-gather 表获取 */
-       int (*get_sgtable)(struct device *dev, struct sg_table *sgt,
-                          void *cpu_addr, dma_addr_t dma_addr,
-                          size_t size, unsigned long attrs);
-
-       /* 流式 DMA 映射 */
-       dma_addr_t (*map_page)(...);
-       void (*unmap_page)(...);
-       int (*map_sg)(...);
-       void (*unmap_sg)(...);
-       dma_addr_t (*map_resource)(...);
-       void (*unmap_resource)(...);
-
-       /* CPU/设备同步 */
-       void (*sync_single_for_cpu)(...);
-       void (*sync_single_for_device)(...);
-       void (*sync_sg_for_cpu)(...);
-       void (*sync_sg_for_device)(...);
-       void (*cache_sync)(...);
-
-       /* 能力查询 */
-       int (*dma_supported)(struct device *dev, u64 mask);
-       u64 (*get_required_mask)(struct device *dev);
-       size_t (*max_mapping_size)(struct device *dev);
-       size_t (*opt_mapping_size)(void);
-       unsigned long (*get_merge_boundary)(struct device *dev);
+       /* 流式 DMA 映射 / CPU 同步 / 能力查询 ... */
    };
 
 **关键实现者:**
 
-- ``dma_dummy_ops`` — ``kernel/dma/dummy.c`` (空操作，用于无 DMA 能力的设备)
 - ``iommu_dma_ops`` — ``drivers/iommu/dma-iommu.c:1547`` (IOMMU DMA 操作)
+  ``.alloc = iommu_dma_alloc``, ``.free = iommu_dma_free``
 
-3.2 struct dma_coherent_mem
+3.2 struct iommu_ops
+~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``include/linux/iommu.h:229``
+
+IOMMU 驱动注册的操作函数表:
+
+::
+
+   struct iommu_ops {
+       /* 设备生命周期 */
+       bool (*capable)(enum iommu_cap);
+       struct iommu_domain *(*domain_alloc)(unsigned iommu_domain_type);
+       struct device *(*probe_device)(struct device *dev);
+       void (*release_device)(struct device *dev);
+
+       /* 组和属性 */
+       struct iommu_group *(*device_group)(struct device *dev);
+       void (*get_resv_regions)(struct device *dev, struct list_head *head);
+       enum iommu_resv_type (*get_resv_regions)(...);  /* (注: 6.1 改为新接口) */
+       int (*of_xlate)(struct iommu_ops *ops, struct of_phandle_args *args);
+
+       /* 域操作 (嵌入 default_domain_ops) */
+       const struct iommu_domain_ops *default_domain_ops;
+
+       unsigned long pgsize_bitmap;
+       struct module *owner;
+   };
+
+3.3 struct iommu_domain_ops
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**定义位置:** ``kernel/dma/coherent.c:13-21``
+**定义位置:** ``include/linux/iommu.h:287``
 
-每设备一致性内存池，由 ``dma_declare_coherent_memory()`` 从保留内存区域创建:
+IOMMU 域操作，在 Linux 6.1 中从 iommu_ops 分离到独立结构体:
+
+::
+
+   struct iommu_domain_ops {
+       int (*attach_dev)(struct iommu_domain *domain, struct device *dev);
+       void (*detach_dev)(struct iommu_domain *domain, struct device *dev);
+
+       /* 页表映射 - dma_alloc_coherent 走 map_pages 路径 */
+       int (*map)(struct iommu_domain *, unsigned long iova,
+                  phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+       int (*map_pages)(struct iommu_domain *, unsigned long iova,
+                        phys_addr_t paddr, size_t pgsize, size_t pgcount,
+                        int prot, gfp_t gfp, size_t *mapped);
+
+       /* 页表解除映射 */
+       size_t (*unmap)(struct iommu_domain *, unsigned long iova,
+                       size_t size, struct iommu_iotlb_gather *gather);
+       size_t (*unmap_pages)(struct iommu_domain *, unsigned long iova,
+                             size_t pgsize, size_t pgcount,
+                             struct iommu_iotlb_gather *gather);
+
+       /* TLB 刷新 */
+       void (*flush_iotlb_all)(struct iommu_domain *domain);
+       void (*iotlb_sync_map)(struct iommu_domain *domain,
+                               unsigned long iova, size_t size);
+       void (*iotlb_sync)(struct iommu_domain *domain,
+                          struct iommu_iotlb_gather *iotlb_gather);
+
+       /* 地址转换 & 嵌套 */
+       phys_addr_t (*iova_to_phys)(struct iommu_domain *, dma_addr_t iova);
+       int (*enable_nesting)(struct iommu_domain *domain);
+       int (*set_pgtable_quirks)(struct iommu_domain *, unsigned long quirks);
+       void (*free)(struct iommu_domain *domain);
+   };
+
+**ARM SMMUv3 实现** — ``arm-smmu-v3.c:2858``:
+
+- ``.map_pages = arm_smmu_map_pages`` (:2472) — 委托给 ``pgtbl_ops->map_pages``
+- ``.unmap_pages = arm_smmu_unmap_pages`` (:2484) — 委托给 ``pgtbl_ops->unmap_pages``
+- ``.iotlb_sync = arm_smmu_iotlb_sync`` (:2505) — TLB 无效化同步
+- ``.flush_iotlb_all = arm_smmu_flush_iotlb_all`` (:2497)
+- ``.attach_dev = arm_smmu_attach_dev`` (:2396)
+
+3.4 struct iommu_domain
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``include/linux/iommu.h:90``
+
+::
+
+   struct iommu_domain {
+       unsigned type;                           /* DMA, DMA_FQ, IDENTITY, UNMANAGED */
+       const struct iommu_domain_ops *ops;      /* 域操作 (SMMU 驱动设置) */
+       unsigned long pgsize_bitmap;              /* 支持的页大小位图 */
+       iommu_fault_handler_t handler;           /* 页面错误回调 */
+       void *handler_token;
+       struct iommu_domain_geometry geometry;    /* IOVA 窗口范围 */
+       struct iommu_dma_cookie *iova_cookie;     /* DMA-IOMMU 层 IOVA 管理 */
+   };
+
+**域类型标志:**
+
+- ``IOMMU_DOMAIN_DMA`` = ``__IOMMU_DOMAIN_PAGING | __IOMMU_DOMAIN_DMA_API``
+- ``IOMMU_DOMAIN_DMA_FQ`` = 加上 ``__IOMMU_DOMAIN_DMA_FQ`` (flush queue 延迟 TLB 刷新)
+
+3.5 struct iommu_domain_geometry
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``include/linux/iommu.h:54``
+
+::
+
+   struct iommu_domain_geometry {
+       dma_addr_t aperture_start;   /* IOVA 空间起始地址 */
+       dma_addr_t aperture_end;     /* IOVA 空间结束地址 */
+       bool force_aperture;         /* 强制 IOVA 必须在窗口内 */
+   };
+
+3.6 struct io_pgtable_ops
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``include/linux/io-pgtable.h:162``
+
+IO 页表操作抽象层，SMMU 驱动通过此接口操作硬件页表:
+
+::
+
+   struct io_pgtable_ops {
+       int (*map)(struct io_pgtable_ops *ops, unsigned long iova,
+                  phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+       int (*map_pages)(struct io_pgtable_ops *ops, unsigned long iova,
+                        phys_addr_t paddr, size_t pgsize, size_t pgcount,
+                        int prot, gfp_t gfp, size_t *mapped);
+       size_t (*unmap)(struct io_pgtable_ops *ops, unsigned long iova,
+                       size_t size, struct iommu_iotlb_gather *gather);
+       size_t (*unmap_pages)(struct io_pgtable_ops *ops, unsigned long iova,
+                             size_t pgsize, size_t pgcount,
+                             struct iommu_iotlb_gather *gather);
+       phys_addr_t (*iova_to_phys)(struct io_pgtable_ops *ops, unsigned long iova);
+   };
+
+**ARM LPAE 实现** — ``drivers/iommu/io-pgtable-arm.c:803``:
+
+- ``.map_pages = arm_lpae_map_pages`` (:464) — 写入 LPAE 页表 PTE
+- ``.unmap_pages = arm_lpae_unmap_pages`` (:664) — 清除 PTE valid 位
+
+3.7 struct arm_smmu_device (SMMUv3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h:618``
+
+::
+
+   struct arm_smmu_device {
+       struct device          *dev;           /* SMMU 设备 */
+       void __iomem           *base;          /* MMIO 寄存器基地址 */
+       void __iomem           *page1;         /* MMIO 页面1 (可选) */
+
+       u32                     features;      /* 特性位图 */
+       /* 关键特性位: */
+       /*   ARM_SMMU_FEAT_2_LVL_STRTAB  - 两级流表 */
+       /*   ARM_SMMU_FEAT_TRANS_S1      - Stage 1 翻译 */
+       /*   ARM_SMMU_FEAT_TRANS_S2      - Stage 2 翻译 */
+       /*   ARM_SMMU_FEAT_ATS           - 地址转换服务 */
+       /*   ARM_SMMU_FEAT_COHERENCY     - 一致性 walk */
+       /*   ARM_SMMU_FEAT_SVA           - 共享虚拟地址 */
+       /*   ARM_SMMU_FEAT_RANGE_INV     - 范围无效化 */
+
+       struct arm_smmu_cmdq      cmdq;          /* 命令队列 */
+       struct arm_smmu_evtq      evtq;          /* 事件队列 */
+       struct arm_smmu_priq      priq;          /* 页面请求队列 */
+
+       unsigned long            ias;           /* IO 地址空间位数 */
+       unsigned long            oas;           /* 输出地址空间位数 */
+       unsigned long            pgsize_bitmap; /* 支持的页大小 */
+
+       u32                     asid_bits;      /* ASID 位数 */
+       u32                     vmid_bits;      /* VMID 位数 */
+       unsigned long           *vmid_map;       /* VMID 位图分配器 */
+       u32                     ssid_bits;      /* SubStreamID 位数 */
+       u32                     sid_bits;       /* StreamID 位数 */
+
+       struct arm_smmu_strtab_cfg strtab_cfg;   /* 流表配置 */
+       struct rb_root           streams;        /* Stream 入口红黑树 */
+       struct iommu_device      iommu;          /* IOMMU core 句柄 */
+   };
+
+3.8 struct arm_smmu_domain (SMMUv3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h:709``
+
+::
+
+   struct arm_smmu_domain {
+       struct arm_smmu_device  *smmu;           /* 所属 SMMU */
+       struct mutex             init_mutex;     /* 初始化互斥锁 */
+       struct io_pgtable_ops   *pgtbl_ops;      /* IO 页表操作 */
+
+       unsigned int             stall_enabled;  /* Stall 模式 */
+       unsigned int             nr_ats_masters; /* ATS 使能的 master 数 */
+       enum arm_smmu_domain_stage stage;        /* S1, S2, NESTED, BYPASS */
+
+       union {
+           struct arm_smmu_s1_cfg s1_cfg;       /* Stage 1 配置 */
+           struct arm_smmu_s2_cfg s2_cfg;       /* Stage 2 配置 */
+       };
+
+       struct iommu_domain      domain;         /* 内嵌 iommu_domain */
+       struct list_head         devices;        /* 域内设备链表 */
+       spinlock_t               devices_lock;
+       struct mmu_notifier      *mmu_notifiers;  /* SVA 通知器 */
+   };
+
+**Stage 1 配置 (s1_cfg) 关键字段:**
+
+- ``cd.asid`` — 地址空间标识符
+- ``cd.ttbr`` — 翻译表基地址寄存器 (页表根指针)
+- ``cd.tcr`` — 翻译控制寄存器 (页表格式/大小)
+- ``cd.mair`` — 内存属性间接寄存器 (cache 策略)
+- ``s1cdmax`` — 最大 SubStreamID 值
+
+**Stage 2 配置 (s2_cfg) 关键字段:**
+
+- ``vmid`` — 虚拟机标识符
+- ``vttbr`` — 虚拟化翻译表基地址
+- ``vtcr`` — 虚拟化翻译控制寄存器
+
+3.9 struct arm_smmu_master (SMMUv3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**定义位置:** ``drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h:686``
+
+::
+
+   struct arm_smmu_master {
+       struct arm_smmu_device  *smmu;           /* 所属 SMMU */
+       struct device           *dev;            /* 关联的设备 */
+       struct arm_smmu_domain  *domain;         /* 当前绑定域 */
+       struct list_head         domain_head;    /* 域内设备链表节点 */
+       struct arm_smmu_stream  *streams;        /* Stream 描述符数组 */
+       unsigned int             num_streams;    /* Stream 数量 */
+       unsigned int             ats_enabled;    /* ATS 使能 */
+       unsigned int             stall_enabled;  /* Stall 使能 */
+       unsigned int             sva_enabled;    /* SVA 使能 */
+       unsigned int             ssid_bits;      /* SSID 位数 */
+   };
+
+3.10 其他关键数据结构
+~~~~~~~~~~~~~~~~~~~~~~~
+
+**struct dma_coherent_mem** — ``kernel/dma/coherent.c:13-21``
 
 ::
 
    struct dma_coherent_mem {
-       void           *virt_base;     /* CPU 虚拟地址基地址 (ioremap 后) */
-       dma_addr_t      device_base;   /* 设备端看到的 DMA 总线地址基地址 */
-       unsigned long   pfn_base;      /* 起始页帧号 */
-       int             size;          /* 内存区域大小 (以页为单位) */
-       unsigned long  *bitmap;        /* 位图分配器，追踪已分配页 */
-       spinlock_t      spinlock;      /* 保护 bitmap 的自旋锁 */
-       bool            use_dev_dma_pfn_offset;  /* 是否使用 PFN 偏移 */
+       void           *virt_base;     /* CPU 虚拟地址基地址 */
+       dma_addr_t      device_base;   /* 设备端 DMA 总线地址 */
+       unsigned long   pfn_base;      /* 起始 PFN */
+       int             size;          /* 大小 (页为单位) */
+       unsigned long  *bitmap;        /* 位图分配器 */
+       spinlock_t      spinlock;
+       bool            use_dev_dma_pfn_offset;
    };
 
-**使用方式:**
-
-- 初始化: ``dma_declare_coherent_memory()`` — ``coherent.c:117``
-- 分配: ``dma_alloc_from_dev_coherent()`` → ``__dma_alloc_from_coherent()`` → ``bitmap_find_free_region()``
-- 释放: ``dma_release_from_dev_coherent()`` → ``__dma_release_from_coherent()`` → ``bitmap_release_region()``
-
-3.3 struct device 中的 DMA 相关成员
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**定义位置:** ``include/linux/device.h:588-651``
-
-::
-
-   struct device {
-       /* DMA 映射操作 (CONFIG_DMA_OPS) */
-       const struct dma_map_ops *dma_ops;           /* :588  DMA 操作函数表 */
-
-       /* DMA 地址掩码 */
-       u64  *dma_mask;                              /* :590  流式 DMA 掩码 */
-       u64   coherent_dma_mask;                     /* :591  一致性 DMA 掩码 */
-
-       /* DMA 约束 */
-       u64   bus_dma_limit;                         /* :596  上游桥/总线 DMA 限制 */
-       struct device_dma_parameters *dma_parms;     /* :599  段大小等参数 */
-
-       /* 一致性内存 */
-       struct dma_coherent_mem *dma_mem;            /* :604  设备专属一致性内存池 */
-       struct cma *cma_area;                        /* :608  设备专属 CMA 区域 */
-
-       /* DMA 属性标志位 */
-       bool dma_coherent:1;                         /* :648  设备是否 DMA 一致 */
-       bool dma_ops_bypass:1;                       /* :651  是否绕过 dma_ops */
-   };
-
-3.4 struct cma (Contiguous Memory Allocator)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**定义位置:** ``include/linux/cma.h``
-
-CMA 管理器结构，用于在启动后分配大块连续物理内存:
+**struct cma** — ``include/linux/cma.h``
 
 ::
 
    struct cma {
        unsigned long   base_pfn;      /* CMA 区域起始 PFN */
        unsigned long   count;         /* 总页数 */
-       unsigned long   *bitmap;       /* 位图管理器 */
-       struct mutex    lock;          /* 互斥锁 */
-       const char     *name;          /* CMA 名称 */
-       /* ... 其他管理字段 ... */
+       unsigned long  *bitmap;        /* 位图管理器 */
+       struct mutex    lock;
+       const char     *name;
    };
 
-**关键全局变量:**
+**struct device 中的 DMA 成员** — ``include/linux/device.h:588-651``
 
-- ``dma_contiguous_default_area`` — ``kernel/dma/contiguous.c:60``
-  全局默认 CMA 区域，由 ``dma_contiguous_reserve()`` 初始化
+::
 
-3.5 DMA 属性常量
-~~~~~~~~~~~~~~~~~
+   struct device {
+       const struct dma_map_ops *dma_ops;           /* :588  */
+       u64  *dma_mask;                              /* :590  */
+       u64   coherent_dma_mask;                     /* :591  */
+       u64   bus_dma_limit;                         /* :596  */
+       struct device_dma_parameters *dma_parms;     /* :599  */
+       struct dma_coherent_mem *dma_mem;            /* :604  */
+       struct cma *cma_area;                        /* :608  */
+       bool dma_coherent:1;                         /* :648  */
+       bool dma_ops_bypass:1;                       /* :651  */
+   };
 
-**定义位置:** ``include/linux/dma-mapping.h:23-62``
+**DMA 属性常量** — ``include/linux/dma-mapping.h:23-62``
 
 ::
 
    DMA_ATTR_WEAK_ORDERING       (1UL << 1)  /* 允许读写乱序 */
-   DMA_ATTR_WRITE_COMBINE       (1UL << 2)  /* 写合并优化 */
-   DMA_ATTR_NO_KERNEL_MAPPING   (1UL << 4)  /* 不创建内核虚拟映射 */
-   DMA_ATTR_SKIP_CPU_SYNC       (1UL << 5)  /* 跳过 CPU cache 同步 */
-   DMA_ATTR_FORCE_CONTIGUOUS    (1UL << 6)  /* 强制物理连续分配 */
-   DMA_ATTR_ALLOC_SINGLE_PAGES  (1UL << 7)  /* 提示无需 TLB 优化 */
-   DMA_ATTR_NO_WARN             (1UL << 8)  /* 抑制分配失败警告 */
-   DMA_ATTR_PRIVILEGED          (1UL << 9)  /* 特权级可访问 */
-
-3.6 struct dma_sgt_handle
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**定义位置:** ``include/linux/dma-map-ops.h:230-233``
-
-非连续 DMA 分配的包装结构:
-
-::
-
-   struct dma_sgt_handle {
-       struct sg_table sgt;          /* scatter-gather 表 */
-       struct page   **pages;        /* 页面指针数组 */
-   };
+   DMA_ATTR_WRITE_COMBINE       (1UL << 2)  /* 写合并 */
+   DMA_ATTR_NO_KERNEL_MAPPING   (1UL << 4)  /* 无内核映射 */
+   DMA_ATTR_SKIP_CPU_SYNC       (1UL << 5)  /* 跳过 cache 同步 */
+   DMA_ATTR_FORCE_CONTIGUOUS    (1UL << 6)  /* 强制物理连续 */
+   DMA_ATTR_ALLOC_SINGLE_PAGES  (1UL << 7)  /* 单页分配提示 */
+   DMA_ATTR_NO_WARN             (1UL << 8)  /* 抑制警告 */
+   DMA_ATTR_PRIVILEGED          (1UL << 9)  /* 特权级 */
 
 4. 执行阶段
 ------------
 
 4.1 初始化阶段 (Boot Time)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-在系统启动过程中，DMA 子系统的各组件按以下顺序初始化:
 
 ::
 
@@ -347,132 +621,133 @@ CMA 管理器结构，用于在启动后分配大块连续物理内存:
    ├─────────────────────────────────────────────────────────────────┤
    │                                                                 │
    │  1. early_param("cma", ...)                                     │
-   │     └── 解析 cma= 内核命令行参数                                │
-   │         [kernel/dma/contiguous.c:78]                            │
+   │     └── 解析 cma= 内核参数  [kernel/dma/contiguous.c:78]        │
    │                                                                 │
    │  2. early_param("coherent_pool", ...)                           │
-   │     └── 解析 coherent_pool= 内核命令行参数                      │
-   │         [kernel/dma/pool.c:29]                                  │
+   │     └── 解析 coherent_pool=  [kernel/dma/pool.c:29]             │
    │                                                                 │
-   │  3. dma_contiguous_reserve(limit)                               │
-   │     └── arch 特定代码调用 (setup_arch 等)                       │
-   │         [kernel/dma/contiguous.c:167]                           │
-   │         ├── 确定 CMA 大小 (配置/百分比/命令行)                   │
-   │         └── dma_contiguous_reserve_area()                       │
-   │             └── cma_declare_contiguous()                        │
-   │                 └── 从 memblock 保留物理内存                    │
+   │  3. SMMU 驱动探测 (platform_driver)                             │
+   │     └── arm_smmu_device_probe() / arm_smmu_device_dt_probe()    │
+   │         ├── 解析设备树 SMMU 节点                                │
+   │         ├── 初始化 MMIO 寄存器、命令队列、事件队列               │
+   │         ├── arm_smmu_init_strtab() → 分配流表                   │
+   │         ├── arm_smmu_init_queues() → 初始化 CMDQ/EVTQ           │
+   │         └── iommu_device_register() → 注册到 IOMMU core         │
    │                                                                 │
-   │  4. RESERVEDMEM_OF_DECLARE("shared-dma-pool")                   │
-   │     └── 解析设备树 reserved-memory 节点                          │
-   │         [kernel/dma/contiguous.c:441 - CMA]                     │
-   │         [kernel/dma/coherent.c:400 - Coherent Pool]             │
+   │  4. dma_contiguous_reserve()  [kernel/dma/contiguous.c:167]      │
+   │     └── 从 memblock 保留 CMA 物理区域                           │
    │                                                                 │
-   │  5. core_initcall: dma_init_reserved_memory()                   │
-   │     └── 初始化全局一致性内存池 (DMA_GLOBAL_POOL)                │
-   │         [kernel/dma/coherent.c:390]                             │
+   │  5. postcore_initcall: dma_atomic_pool_init()                   │
+   │     └── 初始化 3 个原子 DMA 池  [kernel/dma/pool.c:187]         │
    │                                                                 │
-   │  6. postcore_initcall: dma_atomic_pool_init()                   │
-   │     └── 初始化原子 DMA 池 (3 个 gen_pool)                      │
-   │         [kernel/dma/pool.c:187]                                 │
-   │         ├── atomic_pool_kernel  (GFP_KERNEL)                   │
-   │         ├── atomic_pool_dma     (GFP_DMA)                      │
-   │         └── atomic_pool_dma32   (GFP_DMA32)                    │
-   │                                                                 │
-   │  7. 设备探测阶段                                                │
-   │     ├── arch_setup_dma_ops()                                    │
-   │     │   └── 设置 dev->dma_coherent, dev->dma_ops               │
-   │     │   └── iommu_setup_dma_ops() → 设置 iommu_dma_ops        │
-   │     ├── dma_declare_coherent_memory()                           │
-   │     │   └── 为设备创建 dma_coherent_mem 池                     │
-   │     └── rmem_dma_device_init() / rmem_cma_device_init()         │
-   │         └── 将 DT reserved-memory 绑定到设备                   │
+   │  6. 设备探测阶段 (Device Tree / ACPI)                            │
+   │     │                                                            │
+   │     ├── iommu_probe_device()                                    │
+   │     │   └── SMMU: arm_smmu_probe_device()                       │
+   │     │       ├── 解析 iommu-map / iommus 属性                    │
+   │     │       ├── 分配 arm_smmu_master, 配置 stream IDs            │
+   │     │       └── dev_iommu_priv_set(dev, master)                 │
+   │     │                                                            │
+   │     ├── arch_setup_dma_ops()  [arch/arm64/mm/dma-mapping.c:49]  │
+   │     │   ├── dev->dma_coherent = coherent                        │
+   │     │   └── [有 iommu] iommu_setup_dma_ops()                    │
+   │     │       ├── iommu_get_domain_for_dev(dev)                   │
+   │     │       ├── iommu_dma_init_domain()                         │
+   │     │       │   └── init_iova_domain(iovad, base, limit)        │
+   │     │       │       └── 初始化 IOVA 空间 + rcache               │
+   │     │       └── dev->dma_ops = &iommu_dma_ops                   │
+   │     │                                                            │
+   │     └── iommu_attach_device(domain, dev)  [iommu.c:1952]        │
+   │         └── arm_smmu_attach_dev()  [arm-smmu-v3.c:2396]         │
+   │             ├── arm_smmu_domain_finalise()                      │
+   │             │   ├── 选择 S1/S2 格式 (ARM_64_LPAE_S1/S2)        │
+   │             │   ├── alloc_io_pgtable_ops(fmt, &cfg, domain)     │
+   │             │   │   └── 分配页表根, 填充 cfg (TTBR/TCR/MAIR)   │
+   │             │   ├── [S1] arm_smmu_domain_finalise_s1()          │
+   │             │   │   ├── xa_alloc(&arm_smmu_asid_xa) [分配ASID] │
+   │             │   │   ├── arm_smmu_alloc_cd_tables() [CD 表]      │
+   │             │   │   └── arm_smmu_write_ctx_desc() [写 CD]      │
+   │             │   ├── [S2] arm_smmu_domain_finalise_s2()          │
+   │             │   │   ├── arm_smmu_bitmap_alloc(vmid_map) [VMID]  │
+   │             │   │   └── 配置 VTTBR/VTCR                         │
+   │             │   └── smmu_domain->pgtbl_ops = pgtbl_ops          │
+   │             ├── arm_smmu_install_ste_for_dev()                  │
+   │             │   └── arm_smmu_write_strtab_ent() [写 STE]        │
+   │             └── arm_smmu_enable_ats()  [可选]                    │
    │                                                                 │
    └─────────────────────────────────────────────────────────────────┘
 
-4.2 运行时阶段 (Runtime Allocation)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-``dma_alloc_coherent`` 的运行时分配路径:
+4.2 运行时阶段 (IOMMU 路径分配)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
    ┌─────────────────────────────────────────────────────────────────┐
-   │                   运行时分配决策树                              │
+   │                dma_alloc_coherent IOMMU 路径决策树              │
    ├─────────────────────────────────────────────────────────────────┤
    │                                                                 │
-   │  dma_alloc_coherent(dev, size, dma_handle, gfp)                │
-   │    │                                                            │
-   │    ├─ Step 1: 检查 dev->dma_mem (设备专属一致性池)             │
-   │    │   └── 有 → bitmap_find_free_region() → 直接返回           │
-   │    │                                                            │
-   │    ├─ Step 2: 判断 Direct vs IOMMU 路径                        │
-   │    │   ├── ops == NULL → Direct 路径                            │
-   │    │   ├── dma_ops_bypass == true → Direct 路径                │
-   │    │   └── 否则 → IOMMU 路径 (ops->alloc)                      │
-   │    │                                                            │
-   │    ├─ Step 3 [Direct]: dma_direct_alloc()                      │
-   │    │   │                                                        │
-   │    │   ├── [NO_KERNEL_MAPPING] → 仅分配页面,无内核映射         │
-   │    │   │                                                        │
-   │    │   ├── [非一致设备]                                         │
-   │    │   │   ├── CONFIG_DMA_GLOBAL_POOL → 全局一致性池            │
-   │    │   │   ├── 原子上下文 → dma_direct_alloc_from_pool()       │
-   │    │   │   └── 可阻塞 → __dma_direct_alloc_pages() + remap     │
-   │    │   │                                                        │
-   │    │   ├── [一致设备]                                           │
-   │    │   │   ├── 原子 + 需解密 → dma_direct_alloc_from_pool()   │
-   │    │   │   └── 可阻塞 → __dma_direct_alloc_pages()             │
-   │    │   │       ├── CMA 优先 (dma_alloc_contiguous)              │
-   │    │   │       ├── Buddy 回退 (alloc_pages_node)               │
-   │    │   │       └── ZONE 降级重试 (DMA32 → DMA)                 │
-   │    │   │                                                        │
-   │    │   └── Step 4: 建立内核虚拟映射 + 清零                      │
-   │    │       ├── HighMem/remap → vmap() (VM_DMA_COHERENT)        │
-   │    │       └── Normal → page_address() + set_memory_decrypted  │
-   │    │                                                            │
-   │    └─ Step 3 [IOMMU]: iommu_dma_alloc()                        │
-   │        ├── 阻塞 + 非强制连续 → iommu_dma_alloc_remap()        │
-   │        │   └── alloc_pages + vmap + iommu_map (IOVA)           │
-   │        ├── 原子 + 非一致 → dma_alloc_from_pool()               │
-   │        └── 默认 → iommu_dma_alloc_pages() + __iommu_dma_map() │
+   │  dma_alloc_coherent(dev, size, &handle, gfp)                   │
+   │    └── dma_alloc_attrs()                                       │
+   │        └── [dma_ops == iommu_dma_ops]                           │
+   │            └── iommu_dma_alloc()                                │
+   │                │                                                │
+   │                ├─ 可阻塞 且 !FORCE_CONTIGUOUS?                  │
+   │                │  └── YES: 路径 A (最常用)                       │
+   │                │      └── iommu_dma_alloc_remap()               │
+   │                │          ├── 分配非连续物理页 (Buddy)           │
+   │                │          ├── 分配 IOVA                          │
+   │                │          ├── iommu_map_sg_atomic()              │
+   │                │          │   └── 写入 ARM LPAE 页表             │
+   │                │          └── vmap() 建立内核连续虚拟映射       │
+   │                │                                                │
+   │                ├─ 不可阻塞 且 非一致 且 DMA_DIRECT_REMAP?       │
+   │                │  └── YES: 路径 B (原子池)                      │
+   │                │      └── dma_alloc_from_pool()                 │
+   │                │          └── gen_pool_alloc() [无 IOMMU 映射]   │
+   │                │                                                │
+   │                └── 默认: 路径 C (连续)                           │
+   │                    ├── iommu_dma_alloc_pages()                  │
+   │                    │   ├── CMA 或 Buddy 分配连续物理页          │
+   │                    │   └── [非一致] vmap() 建立内核映射          │
+   │                    └── __iommu_dma_map()                        │
+   │                        ├── alloc_iova_fast() [分配 IOVA]        │
+   │                        └── iommu_map_atomic()                  │
+   │                            └── arm_lpae_map_pages()             │
+   │                                └── 写 ARM LPAE 页表 PTE        │
+   │                                                                 │
+   │  返回: (cpu_addr, dma_handle=IOVA)                               │
    │                                                                 │
    └─────────────────────────────────────────────────────────────────┘
 
-4.3 清理阶段 (Free Path)
-~~~~~~~~~~~~~~~~~~~~~~~~~
+4.3 清理阶段 (IOMMU 释放路径)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
    ┌─────────────────────────────────────────────────────────────────┐
-   │                      清理阶段调用链                             │
+   │                dma_free_coherent IOMMU 释放路径                  │
    ├─────────────────────────────────────────────────────────────────┤
    │                                                                 │
-   │  dma_free_coherent(dev, size, cpu_addr, dma_handle)            │
-   │    └── dma_free_attrs()  [kernel/dma/mapping.c:519]            │
-   │        │                                                        │
-   │        ├─ Step 1: dma_release_from_dev_coherent()              │
-   │        │   └── 设备池 → bitmap_release_region() → 返回          │
-   │        │                                                        │
-   │        ├─ Step 2 [Direct]: dma_direct_free()                   │
-   │        │   [kernel/dma/direct.c:322]                            │
-   │        │   ├── [NO_KERNEL_MAPPING] → dma_free_contiguous()     │
-   │        │   ├── [arch fallback] → arch_dma_free()                │
-   │        │   ├── [GLOBAL_POOL + 非一致] →                        │
-   │        │   │   dma_release_from_global_coherent()              │
-   │        │   ├── [原子池] → dma_free_from_pool()                 │
-   │        │   │   └── gen_pool_free()                             │
-   │        │   ├── [vmalloc 区域] → vunmap()                       │
-   │        │   ├── [uncached] → arch_dma_clear_uncached()          │
-   │        │   └── __dma_direct_free_pages()                       │
-   │        │       ├── swiotlb_free() → 如来自 SWIOTLB             │
-   │        │       └── dma_free_contiguous()                       │
-   │        │           ├── cma_release() → 如来自 CMA              │
-   │        │           └── __free_pages() → 如来自 Buddy           │
-   │        │                                                        │
-   │        └─ Step 2 [IOMMU]: ops->free = iommu_dma_free()        │
-   │            [drivers/iommu/dma-iommu.c]                          │
-   │            ├── iommu_dma_free_remap() → vunmap + iommu_unmap   │
-   │            └── dma_free_contiguous() → CMA 或 Buddy 释放       │
+   │  dma_free_coherent(dev, size, cpu_addr, handle)                │
+   │    └── dma_free_attrs()                                         │
+   │        └── [dma_ops == iommu_dma_ops]                           │
+   │            └── iommu_dma_free()                                 │
+   │                │                                                │
+   │                ├── __iommu_dma_unmap(dev, handle, size)         │
+   │                │   ├── iommu_unmap_fast()                       │
+   │                │   │   └── arm_lpae_unmap_pages()               │
+   │                │   │       └── 清除 PTE valid 位                 │
+   │                │   │                                            │
+   │                │   ├── arm_smmu_iotlb_sync() [TLB 无效化]        │
+   │                │   │   └── arm_smmu_tlb_inv_range_domain()      │
+   │                │   │       └── CMDQ_INV_TLB → SMMU 硬件        │
+   │                │   │                                            │
+   │                │   └── free_iova_fast() [回收 IOVA]             │
+   │                │                                                │
+   │                └── __iommu_dma_free(dev, size, cpu_addr)        │
+   │                    ├── [原子池] dma_free_from_pool()             │
+   │                    ├── [vmalloc] vunmap()                       │
+   │                    └── [低内存] dma_free_contiguous()           │
    │                                                                 │
    └─────────────────────────────────────────────────────────────────┘
 
@@ -485,239 +760,262 @@ CMA 管理器结构，用于在启动后分配大块连续物理内存:
 +---------------------------+-------------------------------------------+---------------------------------------+
 | API                       | 作用                                      | 所在文件                              |
 +===========================+===========================================+=======================================+
-| ``alloc_pages_node()``    | 从 Buddy System 分配 2^n 连续物理页        | ``mm/page_alloc.c``                   |
+| ``alloc_pages_node()``    | Buddy System 分配 2^n 连续物理页           | ``mm/page_alloc.c``                   |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``cma_alloc()``           | 从 CMA 区域分配连续物理页                  | ``mm/cma.c``                          |
+| ``cma_alloc()``           | CMA 区域分配连续物理页                     | ``mm/cma.c``                          |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``gen_pool_alloc()``      | 从通用内存池 (genalloc) 原子分配            | ``lib/genalloc.c``                    |
+| ``gen_pool_alloc()``      | 通用内存池原子分配                         | ``lib/genalloc.c``                    |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``swiotlb_alloc()``       | 从 SWIOTLB 弹性缓冲区分配                  | ``kernel/dma/swiotlb.c``              |
-+---------------------------+-------------------------------------------+---------------------------------------+
-
-5.2 内存映射 API
-~~~~~~~~~~~~~~~~
-
-+---------------------------+-------------------------------------------+---------------------------------------+
-| API                       | 作用                                      | 所在文件                              |
-+===========================+===========================================+=======================================+
-| ``vmap()``                | 将离散物理页映射到连续内核虚拟地址          | ``mm/vmalloc.c``                      |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``page_address()``        | 获取低内存页面的内核虚拟地址               | ``include/linux/mm.h``                |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``vunmap()``              | 取消 vmap 创建的内核虚拟映射               | ``mm/vmalloc.c``                      |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``memremap()``            | 将物理内存区域重新映射 (设备一致性池初始化) | ``mm/memremap.c``                     |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``remap_pfn_range()``     | 将物理页帧映射到用户空间 VMA               | ``mm/memory.c``                       |
+| ``swiotlb_alloc()``       | SWIOTLB 弹性缓冲区分配                     | ``kernel/dma/swiotlb.c``              |
 +---------------------------+-------------------------------------------+---------------------------------------+
 
-5.3 内存属性 API
-~~~~~~~~~~~~~~~~
+5.2 IOVA 管理 API
+~~~~~~~~~~~~~~~~~
+
++---------------------------------+-------------------------------------+-----------------------------------+
+| API                             | 作用                                | 所在文件                          |
++=================================+=====================================+===================================+
+| ``alloc_iova_fast()``           | 从 IOVA rcache/空间分配 IOVA         | ``drivers/iommu/iova.c:439``      |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``free_iova_fast()``            | 回收 IOVA 到 rcache                 | ``drivers/iommu/iova.c:487``      |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``init_iova_domain()``          | 初始化 IOVA 域                      | ``drivers/iommu/iova.c``          |
++---------------------------------+-------------------------------------+-----------------------------------+
+
+5.3 IOMMU Core 映射 API
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
++---------------------------------+-------------------------------------+-----------------------------------+
+| API                             | 作用                                | 所在文件                          |
++=================================+=====================================+===================================+
+| ``iommu_map_atomic()``          | 原子上下文建立 IOVA→PA 映射          | ``drivers/iommu/iommu.c:2317``    |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``iommu_unmap_fast()``          | 快速解除 IOVA 映射 (gather TLB)      | ``drivers/iommu/iommu.c:2405``    |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``iommu_attach_device()``       | 将设备绑定到 IOMMU 域                | ``drivers/iommu/iommu.c:1952``    |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``iommu_deferred_attach()``     | 延迟绑定设备到域 (首次 DMA 时触发)   | ``drivers/iommu/iommu.c:1980``    |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``iommu_get_dma_domain()``      | 获取设备的 DMA 域                    | ``drivers/iommu/iommu.c``         |
++---------------------------------+-------------------------------------+--------------------------------===+
+
+5.4 DMA-IOMMU 桥接 API
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
++---------------------------------+-------------------------------------+-----------------------------------+
+| API                             | 作用                                | 所在文件                          |
++=================================+=====================================+===================================+
+| ``iommu_setup_dma_ops()``       | 安装 iommu_dma_ops 到设备           | ``drivers/iommu/dma-iommu.c:1575``|
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``iommu_dma_init_domain()``     | 初始化 IOVA cookie 和 iova_domain   | ``drivers/iommu/dma-iommu.c``     |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``dma_info_to_prot()``          | DMA 方向→IOMMU 保护标志转换          | ``drivers/iommu/dma-iommu.c:605`` |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``__iommu_dma_map()``           | 分配 IOVA + 建立 IOVA→PA 映射       | ``drivers/iommu/dma-iommu.c:697`` |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``__iommu_dma_unmap()``         | 解除映射 + 释放 IOVA                | ``drivers/iommu/dma-iommu.c:674`` |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``iommu_dma_alloc_iova()``      | 分配 IOVA 地址                      | ``drivers/iommu/dma-iommu.c:625`` |
++---------------------------------+-------------------------------------+-----------------------------------+
+
+5.5 ARM SMMUv3 硬件操作 API
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
++---------------------------------+-------------------------------------+-----------------------------------+
+| API                             | 作用                                | 所在文件                          |
++=================================+=====================================+===================================+
+| ``arm_smmu_attach_dev()``      | 设备绑定域, 初始化页表, 写入 STE     | ``arm-smmu-v3.c:2396``            |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``arm_smmu_domain_finalise()``  | 初始化域 (S1/S2, ASID/VMID, 页表)   | ``arm-smmu-v3.c:2164``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_map_pages()``        | 映射页面 → pgtbl_ops->map_pages     | ``arm-smmu-v3.c:2472``            |
++---------------------------------+-------------------------------------+-----------------------------------+
+| ``arm_smmu_unmap_pages()``      | 解除映射 → pgtbl_ops->unmap_pages   | ``arm-smmu-v3.c:2484``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_iotlb_sync()``       | TLB 范围无效化同步                   | ``arm-smmu-v3.c:2505``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_tlb_inv_context()``  | 域级 TLB 全量无效化                  | ``arm-smmu-v3.c:1843``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_write_strtab_ent()`` | 编程 Stream Table Entry (STE)       | ``arm-smmu-v3.c:1239``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_write_ctx_desc()``   | 编程 Context Descriptor (CD)        | ``arm-smmu-v3.c:1038``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_smmu_install_ste_for_dev()``| 为设备所有 stream 写入 STE          | ``arm-smmu-v3.c:2257``            |
++---------------------------------+-------------------------------------+--------------------------------===+
+
+5.6 ARM LPAE 页表 API
+~~~~~~~~~~~~~~~~~~~~~~
+
++---------------------------------+-------------------------------------+-----------------------------------+
+| API                             | 作用                                | 所在文件                          |
++=================================+=====================================+===================================+
+| ``arm_lpae_map_pages()``        | 写入 LPAE 页表 PTE (IOVA→PA)       | ``io-pgtable-arm.c:464``          |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_lpae_unmap_pages()``      | 清除 PTE valid 位                   | ``io-pgtable-arm.c:664``          |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``arm_lpae_prot_to_pte()``      | IOMMU 保护标志→PTE 硬件编码         | ``io-pgtable-arm.c``              |
++---------------------------------+-------------------------------------+--------------------------------===+
+| ``alloc_io_pgtable_ops()``      | 分配 IO 页表 (PGD + 回调)           | ``include/linux/io-pgtable.h:187``|
++---------------------------------+-------------------------------------+--------------------------------===+
+
+5.7 内存映射与属性 API
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 +---------------------------+-------------------------------------------+---------------------------------------+
-| API                       | 作用                                      | 所在文件                              |
-+===========================+===========================================+=======================================+
-| ``dma_pgprot()``          | 根据设备和属性确定页面保护位               | ``kernel/dma/direct.c``               |
+| ``vmap()``                | 离散物理页→连续内核虚拟地址              | ``mm/vmalloc.c``                      |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``set_memory_decrypted()``| 将内存标记为未加密 (AMD SEV)               | ``arch/x86/mm/pat/set_memory.c``      |
+| ``vunmap()``              | 取消 vmap 映射                           | ``mm/vmalloc.c``                      |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``set_memory_encrypted()``| 将内存标记为已加密 (AMD SEV)               | ``arch/x86/mm/pat/set_memory.c``      |
+| ``page_address()``        | 低内存页面→内核虚拟地址                  | ``include/linux/mm.h``                |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``arch_dma_set_uncached()``| 将内存区域设为非缓存 (架构特定)            | 架构实现                              |
+| ``dma_pgprot()``          | 设备 DMA 属性→页面保护位                 | ``kernel/dma/direct.c``               |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| ``arch_dma_prep_coherent()``| 清理 cache 行以准备一致性使用             | 架构实现                              |
+| ``arch_dma_prep_coherent()``| 清理 cache 行 (ARM64: dcache_clean_poc)| 架构实现                              |
 +---------------------------+-------------------------------------------+---------------------------------------+
-
-5.4 Cache 同步 API (ARM64)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
+| ``arch_sync_dma_for_device()``| CPU cache → 设备同步 (ARM64)          | ``arch/arm64/mm/dma-mapping.c``      |
 +---------------------------+-------------------------------------------+---------------------------------------+
-| API                       | 作用                                      | 所在文件                              |
-+===========================+===========================================+=======================================+
-| ``dcache_clean_poc()``    | 清理 (Clean) 指定物理范围的 d-cache        | ``arch/arm64/mm/cache.S``             |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``dcache_inval_poc()``    | 使无效 (Invalidate) 指定范围的 d-cache     | ``arch/arm64/mm/cache.S``             |
-+---------------------------+-------------------------------------------+---------------------------------------+
-
-5.5 地址转换 API
-~~~~~~~~~~~~~~~~
-
-+---------------------------+-------------------------------------------+---------------------------------------+
-| API                       | 作用                                      | 所在文件                              |
-+===========================+===========================================+=======================================+
-| ``phys_to_dma_direct()``  | 物理地址 → DMA 总线地址 (Direct 路径)      | ``kernel/dma/direct.h``               |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``page_to_phys()``        | struct page → 物理地址                    | ``include/linux/mm.h``                |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``page_to_virt()``        | struct page → 内核虚拟地址                 | ``include/linux/mm.h``                |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``pfn_to_page()``         | 页帧号 → struct page 指针                  | ``include/linux/mm.h``                |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``__phys_to_pfn()``       | 物理地址 → 页帧号                          | ``include/linux/pxa.h``               |
-+---------------------------+-------------------------------------------+---------------------------------------+
-
-5.6 位图管理 API
-~~~~~~~~~~~~~~~~
-
-+---------------------------+-------------------------------------------+---------------------------------------+
-| API                       | 作用                                      | 所在文件                              |
-+===========================+===========================================+=======================================+
-| ``bitmap_find_free_region()`` | 在位图中查找并分配一个连续区域          | ``lib/bitmap.c``                      |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``bitmap_release_region()``   | 释放位图中的一个连续区域              | ``lib/bitmap.c``                      |
-+---------------------------+-------------------------------------------+---------------------------------------+
-| ``bitmap_zalloc()``       | 分配并清零位图                            | ``lib/bitmap.c``                      |
+| ``arch_sync_dma_for_cpu()``   | 设备 → CPU cache 同步 (ARM64)         | ``arch/arm64/mm/dma-mapping.c``      |
 +---------------------------+-------------------------------------------+---------------------------------------+
 
 6. 组件交互图
 ---------------
 
-6.1 整体架构交互图
-~~~~~~~~~~~~~~~~~~
+6.1 IOMMU 路径完整架构图
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                        DMA 驱动程序 (Driver)                           │
-   │   dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL)              │
-   └──────────────────────────────┬──────────────────────────────────────────┘
-                                  │
-                                  ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                    DMA Mapping Framework                                │
-   │                    include/linux/dma-mapping.h                          │
-   │  ┌───────────────────────────────────────────────────────────────────┐ │
-   │  │ dma_alloc_coherent()  ───inline wrapper──→  dma_alloc_attrs()     │ │
-   │  └───────────────────────────────────────────────────────────────────┘ │
-   └──────────────────────────────┬──────────────────────────────────────────┘
-                                  │
-                                  ▼
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                     Core Dispatcher                                    │
-   │                     kernel/dma/mapping.c                               │
-   │  ┌─────────────────────────────────────────────────────────────────┐   │
-   │  │                    dma_alloc_attrs()                            │   │
-   │  │                                                                  │   │
-   │  │  1. get_dma_ops(dev) ──→ dma_map_ops* (或 NULL)                │   │
-   │  │  2. dma_alloc_from_dev_coherent() ──→ 设备专属池?              │   │
-   │  │  3. dma_alloc_direct()? ──→ YES: Direct  |  NO: IOMMU         │   │
-   │  └─────────────────────────────────────────────────────────────────┘   │
-   └──────────┬──────────────────────────────────────┬──────────────────────┘
-              │ Direct                               │ IOMMU
-              ▼                                      ▼
-   ┌───────────────────────────┐    ┌───────────────────────────────────────┐
-   │   Direct Mapping          │    │   IOMMU Mapping                      │
-   │   kernel/dma/direct.c     │    │   drivers/iommu/dma-iommu.c          │
-   │                           │    │                                       │
-   │  dma_direct_alloc()       │    │  iommu_dma_alloc()                   │
-   │    ├── 非一致设备处理      │    │    ├── iommu_dma_alloc_remap()       │
-   │    ├── 原子池分配          │    │    ├── dma_alloc_from_pool()         │
-   │    └── 页面分配 + 映射     │    │    └── iommu_dma_alloc_pages()      │
-   └──────┬────┬────┬──────────┘    └───────────┬──────────────────────────┘
-          │    │    │                           │
-          │    │    │                           │
-   ┌──────▼┐ ┌▼────▼────────────┐  ┌──────────▼──────────────────────────┐
-   │ CMA   │ │ Buddy Allocator  │  │ IOMMU Driver                       │
-   │       │ │                  │  │                                    │
-   │ mm/   │ │ mm/page_alloc.c  │  │  __iommu_dma_map()                 │
-   │ cma.c │ │                  │  │    └── iommu_map()                  │
-   │       │ │ alloc_pages_node │  │        └── IOVA → 物理地址映射      │
-   │cma_   │ │ __free_pages     │  │                                    │
-   │alloc()│ │                  │  │  __iommu_dma_unmap()               │
-   │cma_   │ └──────────────────┘  │    └── iommu_unmap()                │
-   │release│                      └──────────────────────────────────────┘
-   └───┬───┘
-       │
-       │    ┌──────────────────────────────────────────┐
-       │    │ Atomic DMA Pool                          │
-       │    │ kernel/dma/pool.c                        │
-       │    │                                          │
-       └───→│  dma_alloc_from_pool()                   │
-            │    └── gen_pool_alloc()                  │
-            │        [atomic_pool_dma]                 │
-            │        [atomic_pool_dma32]               │
-            │        [atomic_pool_kernel]              │
-            │                                          │
-            │  dma_free_from_pool()                    │
-            │    └── gen_pool_free()                   │
-            └──────────────────────────────────────────┘
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                      DMA 驱动程序 (Driver)                           │
+   │   dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL)            │
+   └─────────────────────────────┬───────────────────────────────────────┘
+                                   │
+                                   ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                   DMA Mapping Framework                             │
+   │   dma_alloc_attrs() → dma_alloc_direct? → NO → ops->alloc          │
+   └─────────────────────────────┬───────────────────────────────────────┘
+                                   │
+                                   ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │                 dma-iommu 层 (DMA-IOMMU Glue)                        │
+   │                 drivers/iommu/dma-iommu.c                            │
+   │                                                                      │
+   │  iommu_dma_ops.alloc = iommu_dma_alloc()                           │
+   │      │                                                               │
+   │      ├── 页面分配: alloc_pages / dma_alloc_contiguous               │
+   │      ├── IOVA 管理: alloc_iova_fast / free_iova_fast                │
+   │      ├── 映射接口:   __iommu_dma_map / __iommu_dma_unmap            │
+   │      └── 内核映射:   vmap (VM_DMA_COHERENT) / vunmap               │
+   │                                                                      │
+   └──────────┬──────────────────────────┬───────────────────────────────┘
+              │ __iommu_dma_map          │ __iommu_dma_unmap
+              ▼                          ▼
+   ┌─────────────────────────┐  ┌─────────────────────────────┐
+   │ IOMMU Core              │  │ IOMMU Core (unmap)          │
+   │ drivers/iommu/iommu.c   │  │ drivers/iommu/iommu.c       │
+   │                         │  │                             │
+   │ iommu_map_atomic()      │  │ iommu_unmap_fast()          │
+   │   └── __iommu_map()     │  │   └── __iommu_unmap()       │
+   │       └── ops->map_pages│  │       └── ops->unmap_pages  │
+   └──────────┬──────────────┘  └──────────┬──────────────────┘
+              │ domain_ops                  │ domain_ops
+              ▼                             ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │              ARM SMMUv3 驱动                                      │
+   │              drivers/iommu/arm/arm-smmu-v3/                      │
+   │                                                                  │
+   │  arm_smmu_map_pages()   arm_smmu_unmap_pages()                   │
+   │      │                        │                                  │
+   │      └── pgtbl_ops ─────────────┘                                │
+   │                                                                  │
+   │  arm_smmu_iotlb_sync()    ← TLB 无效化同步                      │
+   │  arm_smmu_attach_dev()    ← 设备绑定 (STE/CD 编程)              │
+   │  arm_smmu_domain_finalise() ← 域初始化 (ASID/VMID/页表)         │
+   └──────────┬──────────────────────────────────────────────────────┘
+              │ pgtbl_ops
+              ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │              ARM LPAE IO 页表                                    │
+   │              drivers/iommu/io-pgtable-arm.c                      │
+   │                                                                  │
+   │  arm_lpae_map_pages()    arm_lpae_unmap_pages()                 │
+   │      │                        │                                 │
+   │      └── __arm_lpae_map() ────┘                                │
+   │          ├── 遍历页表层级: PGD → PUD → PMD → PTE               │
+   │          ├── alloc_pages() 分配页表页                            │
+   │          ├── arm_lpae_install_table() 安装子表                  │
+   │          └── 写入/清除 PTE: PA | prot | valid                    │
+   │                                                                  │
+   └──────────┬──────────────────────────────────────────────────────┘
+              │ 页表写入内存 (DDR)
+              ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │              SMMUv3 硬件                                         │
+   │                                                                  │
+   │  Stream Table (STE) ──→ Context Descriptor (CD) ──→ Page Table  │
+   │                                                                  │
+   │  DMA 事务:                                                       │
+   │    Device ──[StreamID/SSID]──→ STE ──→ CD ──→ PT Walk           │
+   │                                                  │               │
+   │    IOVA ──────────────────────────────────→ PA ──→ DDR          │
+   │                                                                  │
+   │  TLB: 缓存 IOVA→PA 映射                                          │
+   │  CMDQ: 接收 TLB 无效化等命令                                     │
+   │  EVTQ: 报告事件 (fault 等)                                       │
+   └─────────────────────────────────────────────────────────────────┘
 
-   ┌─────────────────────────────────────────────────────────────────────────┐
-   │                    Supporting Components                                │
-   ├─────────────────────────────────────────────────────────────────────────┤
-   │                                                                         │
-   │  ┌────────────────────────┐  ┌────────────────────────────────────┐    │
-   │  │ Device Coherent Pool   │  │ Kernel Remapping                   │    │
-   │  │ kernel/dma/coherent.c  │  │ kernel/dma/remap.c                 │    │
-   │  │                        │  │                                    │    │
-   │  │ dma_coherent_mem       │  │ dma_common_contiguous_remap()     │    │
-   │  │ ├─ virt_base           │  │   └── vmap() (VM_DMA_COHERENT)    │    │
-   │  │ ├─ device_base         │  │                                    │    │
-   │  │ ├─ bitmap              │  │ dma_common_pages_remap()          │    │
-   │  │ └─ spinlock            │  │   └── vmap()                      │    │
-   │  │                        │  │                                    │    │
-   │  │ bitmap 分配器          │  │ dma_common_free_remap()            │    │
-   │  └────────────────────────┘  │   └── vunmap()                     │    │
-   │                                └────────────────────────────────────┘    │
-   │  ┌────────────────────────┐  ┌────────────────────────────────────┐    │
-   │  │ Architecture Hooks     │  │ SWIOTLB                            │    │
-   │  │ (ARM64/x86)            │  │ kernel/dma/swiotlb.c               │    │
-   │  │                        │  │                                    │    │
-   │  │ arch_dma_prep_coherent │  │ 弹性缓冲区:                        │    │
-   │  │ arch_dma_set_uncached  │  │ swiotlb_alloc() / swiotlb_free()  │    │
-   │  │ arch_sync_dma_for_cpu  │  │ 用于:                             │    │
-   │  │ arch_sync_dma_for_dev  │  │   - 32位设备在64位系统              │    │
-   │  │ arch_dma_alloc         │  │   - 内存加密 (SEV)                 │    │
-   │  │ arch_dma_free          │  │                                    │    │
-   │  │ arch_setup_dma_ops     │  └────────────────────────────────────┘    │
-   │  └────────────────────────┘                                            │
-   │                                                                         │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-6.2 内存流向图
-~~~~~~~~~~~~~~
+6.2 SMMUv3 地址翻译流水线
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
    ┌─────────────────────────────────────────────────────────────────┐
-   │                     内存分配流向                                │
-   │                                                                 │
-   │   物理内存 (DDR)                                                │
-   │   ┌─────────────────────────────────────────────────────────┐  │
-   │   │  ┌──────────┐ ┌──────────────┐ ┌───────┐ ┌───────────┐  │  │
-   │   │  │  CMA     │ │  Buddy       │ │Device │ │  SWIOTLB  │  │  │
-   │   │  │  区域    │ │  System      │ │Pool   │ │  Buffer   │  │  │
-   │   │  └────┬─────┘ └──────┬───────┘ └───┬───┘ └─────┬─────┘  │  │
-   │   └───────┼──────────────┼────────────┼───────────┼────────┘  │
-   │           │              │            │           │            │
-   │           ▼              ▼            ▼           ▼            │
-   │   ┌──────────────────────────────────────────────────────┐     │
-   │   │              struct page (物理页)                     │     │
-   │   └──────────────────────┬───────────────────────────────┘     │
-   │                          │                                      │
-   │              ┌───────────┴───────────┐                          │
-   │              ▼                       ▼                           │
-   │   ┌────────────────────┐  ┌─────────────────────┐              │
-   │   │ CPU 虚拟地址        │  │ DMA 总线地址          │              │
-   │   │ (cpu_addr)         │  │ (dma_handle)         │              │
-   │   │                    │  │                      │              │
-   │   │ • page_address()   │  │ • phys_to_dma()      │              │
-   │   │   [直接映射区]      │  │   [Direct 路径]      │              │
-   │   │                    │  │                      │              │
-   │   │ • vmap()           │  │ • iommu_map()        │              │
-   │   │   [vmalloc 区]      │  │   [IOVA 映射]        │              │
-   │   └────────────────────┘  └─────────────────────┘              │
-   │          │                          │                            │
-   │          ▼                          ▼                            │
-   │   ┌────────────────────┐  ┌─────────────────────┐              │
-   │   │ CPU 访问            │  │ 设备 (Device) 访问    │              │
-   │   │ 通过 cpu_addr      │  │ 通过 dma_handle     │              │
-   │   └────────────────────┘  └─────────────────────┘              │
-   │                                                                 │
+   │              SMMUv3 地址翻译流水线 (Stage 1)                     │
+   │                                                                  │
+   │  Device 发出 DMA 事务:                                          │
+   │                                                                  │
+   │  ┌──────────┐    ┌──────────────┐    ┌───────────────┐          │
+   │  │ StreamID │───→│   Stream     │    │   Context     │          │
+   │  │ (SID)    │    │   Table      │    │   Descriptor  │          │
+   │  │          │    │   Entry      │    │   Table       │          │
+   │  │          │    │   (STE)      │───→│   (CD)        │          │
+   │  └──────────┘    │              │    │               │          │
+   │                  │ S1CTXPTR     │    │ TTBR ← 页表根 │          │
+   │                  │ S1CDMAX      │    │ TCR  ← 格式   │          │
+   │                  │ V (=valid)   │    │ MAIR ← 属性   │          │
+   │                  │ CFG=S1_TRANS │    │ ASID          │          │
+   │                  └──────────────┘    └───────┬───────┘          │
+   │                                              │                   │
+   │                                       TTBR 指向页表根            │
+   │                                              │                   │
+   │  IOVA ──────────────────────────────────────┘                   │
+   │                                              │                   │
+   │                          ┌───────────────────┘                   │
+   │                          ▼                                       │
+   │  ┌──────────────────────────────────────────┐                    │
+   │  │           ARM LPAE 页表 Walk              │                    │
+   │  │                                          │                    │
+   │  │   PGD[i] ──→ PUD[j] ──→ PMD[k] ──→ PTE[l]│                   │
+   │  │                                          │                    │
+   │  │   每级:                                  │                    │
+   │  │   ├── 读取表项 (从 DDR, 可选 coherent)    │                    │
+   │  │   ├── 检查 Valid 位                      │                    │
+   │  │   ├── 检查权限 (R/W)                     │                    │
+   │  │   ├── 检查 MAIR/TCR 属性                │                    │
+   │  │   └── 结果缓存到 TLB                    │                    │
+   │  └──────────────────┬───────────────────────┘                    │
+   │                     │                                            │
+   │                     ▼                                            │
+   │  ┌──────────────────────────────────────────┐                    │
+   │  │           物理地址 (PA)                   │                    │
+   │  │           ──→ DDR 访问                    │                    │
+   │  └──────────────────────────────────────────┘                    │
+   │                                                                  │
    └─────────────────────────────────────────────────────────────────┘
 
-6.3 Direct 路径 vs IOMMU 路径对比
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+6.3 DMA 地址空间对比 (Direct vs IOMMU)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
@@ -726,26 +1024,28 @@ CMA 管理器结构，用于在启动后分配大块连续物理内存:
    │   Direct Path (无 IOMMU 或 Bypass)                               │
    │   ─────────────────────────────────                              │
    │                                                                  │
-   │   CPU ──→ [虚拟地址] ──→ [MMU] ──→ [物理地址] ──→ DDR           │
-   │                                        │                         │
-   │   Device ──→ [DMA地址=物理地址] ───────┘                        │
+   │   CPU ──→ [VA] ──→ [MMU] ──→ [PA] ──→ DDR                       │
+   │                                  │                                │
+   │   Device ──→ [DMA=PA] ──────────┘                                │
    │                                                                  │
-   │   特点: DMA地址 = 物理地址 (1:1 映射)                            │
-   │   限制: 设备受限于物理内存范围                                    │
+   │   限制: 设备 DMA 地址 = 物理地址, 受限于物理内存范围              │
    │                                                                  │
    ├──────────────────────────────────────────────────────────────────┤
    │                                                                  │
-   │   IOMMU Path                                                    │
-   │   ──────────────                                                │
+   │   IOMMU Path (SMMU)                                              │
+   │   ──────────────────                                              │
    │                                                                  │
-   │   CPU ──→ [虚拟地址] ──→ [MMU] ──→ [物理地址] ──→ DDR           │
-   │                                        │                         │
-   │                                   ┌────┘                         │
-   │   Device ──→ [IOVA] ──→ [IOMMU] ──┘                             │
-   │                     (DMA地址 → 物理地址转换)                     │
+   │   CPU ──→ [VA] ──→ [MMU] ──→ [PA] ──→ DDR                       │
+   │                                  │                                │
+   │   Device ──→ [IOVA] ──→ [SMMU STE→CD→PT] ──→ [PA] ──→ DDR      │
    │                                                                  │
-   │   特点: IOVA 独立于物理地址空间                                  │
-   │   优势: 设备可访问全部内存, 内存隔离, 地址聚合                  │
+   │   优势:                                                          │
+   │   • IOVA 独立于物理地址, 设备可访问全部内存                      │
+   │   • 内存隔离: 不同域的设备看到不同的地址空间                     │
+   │   • 地址聚合: 非连续物理页映射为连续 IOVA                        │
+   │   • 安全: 设备无法访问未映射的物理区域                            │
+   │                                                                  │
+   │   dma_alloc_coherent 返回的 dma_handle 是 IOVA, 不是物理地址    │
    │                                                                  │
    └──────────────────────────────────────────────────────────────────┘
 
@@ -755,26 +1055,39 @@ CMA 管理器结构，用于在启动后分配大块连续物理内存:
 +------------------------------------------+-----------------------------------------+
 | 文件路径                                 | 功能描述                                |
 +==========================================+=========================================+
+| **DMA Mapping 层**                       |                                         |
++------------------------------------------+-----------------------------------------+
 | ``include/linux/dma-mapping.h``          | API 声明, DMA_ATTR_* 定义              |
-| ``include/linux/dma-map-ops.h``          | struct dma_map_ops, get_dma_ops, 架构钩子 |
-| ``include/linux/device.h``               | struct device (DMA 相关成员 :588-651)   |
-| ``kernel/dma/mapping.c``                 | dma_alloc_attrs/free_attrs 核心调度器   |
-| ``kernel/dma/direct.c``                  | Direct 映射分配器 (dma_direct_alloc)    |
-| ``kernel/dma/direct.h``                  | Direct 映射内联辅助函数                  |
-| ``kernel/dma/coherent.c``                | 设备一致性内存池 (dma_coherent_mem)     |
-| ``kernel/dma/pool.c``                    | 原子 DMA 池 (gen_pool), pool 初始化    |
-| ``kernel/dma/contiguous.c``              | CMA 分配器 (dma_alloc_contiguous)       |
-| ``kernel/dma/remap.c``                   | vmap/vunmap 帮助函数                     |
-| ``kernel/dma/swiotlb.c``                 | SWIOTLB 弹性缓冲区分配器               |
-| ``kernel/dma/dummy.c``                   | 空 DMA 操作 (dma_dummy_ops)             |
-| ``kernel/dma/ops_helpers.c``             | 通用 DMA 辅助函数                       |
-| ``drivers/iommu/dma-iommu.c``            | IOMMU DMA 操作 (iommu_dma_ops)          |
-| ``arch/arm64/mm/dma-mapping.c``          | ARM64 架构钩子 (cache ops)              |
-| ``arch/x86/kernel/pci-dma.c``            | x86 DMA ops 设置                        |
-| ``arch/x86/include/asm/dma-mapping.h``   | x86 get_arch_dma_ops()                  |
-| ``mm/page_alloc.c``                      | Buddy System 页面分配器                 |
+| ``include/linux/dma-map-ops.h``          | struct dma_map_ops, get_dma_ops         |
+| ``include/linux/device.h``               | struct device (DMA 成员 :588-651)       |
+| ``kernel/dma/mapping.c``                 | dma_alloc_attrs 核心调度器              |
+| ``kernel/dma/direct.c``                  | Direct 映射分配器                       |
+| ``kernel/dma/coherent.c``                | 设备一致性内存池                        |
+| ``kernel/dma/pool.c``                    | 原子 DMA 池 (gen_pool)                 |
+| ``kernel/dma/contiguous.c``              | CMA 分配器                              |
+| ``kernel/dma/remap.c``                   | vmap/vunmap 帮助函数                    |
+| **IOMMU 层**                             |                                         |
++------------------------------------------+-----------------------------------------+
+| ``include/linux/iommu.h``                | struct iommu_ops/domain/domain_ops     |
+| ``include/linux/io-pgtable.h``           | struct io_pgtable_ops 接口              |
+| ``drivers/iommu/iommu.c``                | iommu_map_atomic/unmap_fast 核心       |
+| ``drivers/iommu/iova.c``                 | IOVA 空间分配器 (alloc/free_iova_fast) |
+| ``drivers/iommu/dma-iommu.c``            | IOMMU-DMA 桥接 (iommu_dma_ops)         |
+| **ARM SMMU 驱动**                        |                                         |
++------------------------------------------+-----------------------------------------+
+| ``drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c`` | SMMUv3 驱动 (map/unmap/STE/CD)    |
+| ``drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h`` | SMMUv3 数据结构定义                  |
+| ``drivers/iommu/arm/arm-smmu/arm-smmu.c``    | SMMUv1/v2 驱动                      |
+| ``drivers/iommu/arm/arm-smmu/arm-smmu.h``    | SMMUv1/v2 数据结构定义                |
+| ``drivers/iommu/io-pgtable-arm.c``       | ARM LPAE 页表实现 (map_pages/unmap)    |
+| **ARM64 架构钩子**                       |                                         |
++------------------------------------------+-----------------------------------------+
+| ``arch/arm64/mm/dma-mapping.c``          | arch_setup_dma_ops, cache sync hooks   |
+| ``arch/arm64/mm/cache.S``                | dcache_clean_poc / dcache_inval_poc    |
+| **内存分配**                              |                                         |
++------------------------------------------+-----------------------------------------+
+| ``mm/page_alloc.c``                      | Buddy System 分配器                    |
 | ``mm/cma.c``                             | CMA 核心实现                            |
 | ``mm/vmalloc.c``                         | vmap/vunmap 实现                        |
 | ``lib/genalloc.c``                       | 通用内存池 (gen_pool)                   |
 | ``lib/bitmap.c``                         | 位图操作                                |
-+------------------------------------------+-----------------------------------------+
