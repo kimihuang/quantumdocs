@@ -38,6 +38,7 @@ documentation for details.
    tmux_usage
    python_server
    labgrid_for_qemu
+   labgrid_qemu_practice
    ttyd_setup
    macos_remotedesktop_to_ubuntu
    opendataloader_pdf_usage
